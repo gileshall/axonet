@@ -201,9 +201,21 @@ class MeshRenderer:
             # Determine class from the starting node type
             # Find the starting node by matching position with tolerance
             cls_enum = NeuronClass.OTHER
-            start_candidates = [n for n in self.neuron.nodes.values() if np.allclose(n.position, path[0] + (soma_pos if translate_to_origin else 0), atol=1e-9)]
-            if start_candidates:
-                cls_enum = classify_type_id(start_candidates[0].type_id)
+            def _match_node(pos: np.ndarray):
+                world = pos + (soma_pos if translate_to_origin else 0)
+                for n in self.neuron.nodes.values():
+                    if np.allclose(n.position, world, atol=1e-9):
+                        return n
+                return None
+            start_node = _match_node(path[0])
+            if start_node is not None and start_node.type_id == NeuronClass.SOMA:
+                ref_idx = 1 if len(path) > 1 else 0
+                node_for_class = _match_node(path[ref_idx])
+                if node_for_class is not None:
+                    cls_enum = classify_type_id(node_for_class.type_id)
+            else:
+                if start_node is not None:
+                    cls_enum = classify_type_id(start_node.type_id)
             cls = cls_enum.name
             mesh = sweep_circle(path=path, radii=radii, segments=segments, cap=cap, connect=False, kwargs={"process": False})
             groups[cls].append(mesh)
