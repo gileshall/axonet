@@ -116,18 +116,25 @@ def visualize_neuron(filepath: str, size: int = 128, no_color: bool = False):
         return 1
 
 
-def export_mesh(filepath: str, output: str, no_spheres: bool = False):
+def export_mesh(filepath: str, output: str, segments: int = 24, no_cap: bool = False):
     """Export neuron as 3D mesh."""
     try:
         neuron = load_swc(filepath)
         renderer = MeshRenderer(neuron)
-        mesh = renderer.render_to_file(output, add_spheres=not no_spheres)
+        mesh = renderer.render_to_file(output, segments=segments, cap=(not no_cap))
         print(f"Exported mesh with {len(mesh.vertices)} vertices and {len(mesh.faces)} faces to {output}")
         return 0
         
     except Exception as e:
         print(f"Error exporting mesh: {e}", file=sys.stderr)
         return 1
+
+
+def view_3d(filepath: str, segments: int = 18):
+    """Launch interactive 3D viewer."""
+    from .visualization.pyglet_swc_viewer import SWCViewer, pyglet
+    _ = SWCViewer(Path(filepath), segments=segments)
+    pyglet.app.run()
 
 
 def main():
@@ -166,8 +173,14 @@ def main():
     # Export mesh command
     mesh_parser = subparsers.add_parser('mesh', help='Export as 3D mesh')
     mesh_parser.add_argument('input', help='Input SWC file')
-    mesh_parser.add_argument('output', help='Output mesh file')
-    mesh_parser.add_argument('--no-spheres', action='store_true', help='Do not add spheres at nodes')
+    mesh_parser.add_argument('output', help='Output mesh file (e.g. .ply, .obj)')
+    mesh_parser.add_argument('--segments', type=int, default=24, help='Segments around branch circumference')
+    mesh_parser.add_argument('--no-cap', action='store_true', help='Do not cap branch ends')
+
+    # 3D viewer command
+    viewer_parser = subparsers.add_parser('viewer', help='Launch interactive 3D viewer')
+    viewer_parser.add_argument('input', help='Input SWC file')
+    viewer_parser.add_argument('--segments', type=int, default=18, help='Segments around branch circumference')
     
     args = parser.parse_args()
     
@@ -191,7 +204,9 @@ def main():
     elif args.command == 'visualize':
         return visualize_neuron(args.input, args.size, args.no_color)
     elif args.command == 'mesh':
-        return export_mesh(args.input, args.output, args.no_spheres)
+        return export_mesh(args.input, args.output, args.segments, args.no_cap)
+    elif args.command == 'viewer':
+        return view_3d(args.input, args.segments)
     else:
         parser.print_help()
         return 1

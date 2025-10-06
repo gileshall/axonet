@@ -7,6 +7,7 @@ import trimesh
 from typing import Optional, Union
 from pathlib import Path
 from ..core import Neuron
+from .sweep import sweep_circle
 
 
 class MeshRenderer:
@@ -15,115 +16,199 @@ class MeshRenderer:
     def __init__(self, neuron: Neuron):
         self.neuron = neuron
         self.meshes: list[trimesh.Trimesh] = []
-    
-    def create_cylinder(self, start: np.ndarray, end: np.ndarray, 
-                       radius_start: float, radius_end: float,
-                       sections: int = 8) -> trimesh.Trimesh:
-        """Create a tapered cylinder between two points."""
-        direction = end - start
-        height = np.linalg.norm(direction)
-        
-        if height < 1e-6:
-            # Degenerate case: return sphere at start point
-            return trimesh.creation.icosphere(subdivisions=2, radius=radius_start)
-        
-        # Create cylinder along z-axis
-        cylinder = trimesh.creation.cylinder(
-            radius=1.0,
-            height=height,
-            sections=sections
-        )
-        
-        # Scale radii (tapered cylinder)
-        vertices = cylinder.vertices
-        z_coords = vertices[:, 2]
-        z_min, z_max = z_coords.min(), z_coords.max()
-        z_normalized = (z_coords - z_min) / (z_max - z_min)
-        
-        # Interpolate radius along cylinder
-        radii = radius_start + (radius_end - radius_start) * z_normalized
-        vertices[:, 0] *= radii
-        vertices[:, 1] *= radii
-        
-        # Align cylinder with direction vector
-        direction_norm = direction / height
-        z_axis = np.array([0, 0, 1])
-        
-        # Rotation axis and angle
-        rotation_axis = np.cross(z_axis, direction_norm)
-        rotation_axis_norm = np.linalg.norm(rotation_axis)
-        
-        if rotation_axis_norm > 1e-6:
-            rotation_axis /= rotation_axis_norm
-            angle = np.arccos(np.clip(np.dot(z_axis, direction_norm), -1.0, 1.0))
-            rotation_matrix = trimesh.transformations.rotation_matrix(
-                angle, rotation_axis
-            )
-        else:
-            # Vectors are parallel or anti-parallel
-            if np.dot(z_axis, direction_norm) > 0:
-                rotation_matrix = np.eye(4)
-            else:
-                rotation_matrix = trimesh.transformations.rotation_matrix(
-                    np.pi, [1, 0, 0]
-                )
-        
-        cylinder.apply_transform(rotation_matrix)
-        
-        # Translate to start position
-        translation = start + direction / 2
-        cylinder.apply_translation(translation)
-        
-        return cylinder
-    
-    def create_sphere(self, center: np.ndarray, radius: float) -> trimesh.Trimesh:
-        """Create a sphere at the given position."""
-        sphere = trimesh.creation.icosphere(subdivisions=2, radius=radius)
+
+    def _extract_branches(self) -> list[tuple[np.ndarray, np.ndarray]]:
+        branches: list[tuple[np.ndarray, np.ndarray]] = []
+        node_map = self.neuron.nodes
+
+        candidates: list[int] = []
+        for node in node_map.values():
+            is_root = node.parent == -1
+            parent_branch = False
+            if not is_root and node.parent in node_map:
+                parent_branch = len(node_map[node.parent].children) > 1
+            if is_root or parent_branch:
+                candidates.append(node.index)
+
+        for start_idx in candidates:
+            start_node = node_map[start_idx]
+            if len(start_node.children) == 0:
+                continue
+
+            for child_idx in start_node.children:
+                path_positions: list[np.ndarray] = [start_node.position]
+                path_radii: list[float] = [start_node.radius]
+
+                current_idx = child_idx
+                while True:
+                    current = node_map[current_idx]
+                    path_positions.append(current.position)
+                    path_radii.append(current.radius)
+
+                    is_terminal = len(current.children) == 0
+                    is_branch = len(current.children) > 1
+                    if is_terminal or is_branch:
+                        break
+                    current_idx = current.children[0]
+
+                path = np.vstack(path_positions)
+                radii = np.asarray(path_radii, dtype=np.float64)
+                if len(path) >= 2:
+                    branches.append((path, radii))
+
+        return branches
+
+    def _junction_node_indices(self) -> list[int]:
+        idxs: list[int] = []
+        for node in self.neuron.nodes.values():
+            is_root = node.parent == -1
+            deg = len(node.children)
+            if is_root or deg != 1:
+                idxs.append(node.index)
+        return idxs
+
+    def _create_sphere(self, center: np.ndarray, radius: float, *, subdivisions: int = 2) -> trimesh.Trimesh:
+        sphere = trimesh.creation.icosphere(subdivisions=subdivisions, radius=radius)
         sphere.apply_translation(center)
         return sphere
-    
-    def build_mesh(self, add_spheres: bool = True) -> trimesh.Trimesh:
-        """Build complete neuron mesh from SWC nodes."""
-        meshes = []
-        
-        for node in self.neuron.nodes.values():
-            position = node.position
-            
-            # Add sphere at node position (optional, helps with visualization)
-            if add_spheres:
-                sphere = self.create_sphere(position, node.radius)
-                meshes.append(sphere)
-            
-            # Create cylinder to parent node
-            if node.parent != -1 and node.parent in self.neuron.nodes:
-                parent = self.neuron.nodes[node.parent]
-                parent_pos = parent.position
-                
-                cylinder = self.create_cylinder(
-                    parent_pos, position,
-                    parent.radius, node.radius
-                )
-                meshes.append(cylinder)
-        
-        # Combine all meshes
+
+    def _get_soma_node(self):
+        soma_idx = self.neuron.soma_index
+        if soma_idx is None:
+            roots = [n for n in self.neuron.nodes.values() if n.parent == -1]
+            if not roots:
+                return None
+            return roots[0]
+        return self.neuron.nodes.get(soma_idx)
+
+    def _extract_branches_from_soma(self) -> list[tuple[np.ndarray, np.ndarray]]:
+        soma = self._get_soma_node()
+        if soma is None:
+            return []
+
+        branches: list[tuple[np.ndarray, np.ndarray]] = []
+
+        def walk_from(start_idx: int):
+            start_node = self.neuron.nodes[start_idx]
+            for child_idx in start_node.children:
+                path_positions: list[np.ndarray] = [start_node.position]
+                path_radii: list[float] = [start_node.radius]
+                current_idx = child_idx
+                while True:
+                    current = self.neuron.nodes[current_idx]
+                    path_positions.append(current.position)
+                    path_radii.append(current.radius)
+                    deg = len(current.children)
+                    if deg != 1:
+                        break
+                    current_idx = current.children[0]
+                path = np.vstack(path_positions)
+                radii = np.asarray(path_radii, dtype=np.float64)
+                if len(path) >= 2:
+                    branches.append((path, radii))
+                if len(self.neuron.nodes[current_idx].children) > 1:
+                    walk_from(current_idx)
+
+        walk_from(soma.index)
+        return branches
+
+    def _classify(self, type_id: int) -> str:
+        if type_id == 1:
+            return "soma"
+        if type_id == 2:
+            return "axon"
+        if type_id in (3, 4):
+            return "dendrite"
+        return "other"
+
+    def _extract_branches_with_type(self) -> list[tuple[np.ndarray, np.ndarray, str]]:
+        typed: list[tuple[np.ndarray, np.ndarray, str]] = []
+        node_map = self.neuron.nodes
+        candidates: list[int] = []
+        for node in node_map.values():
+            is_root = node.parent == -1
+            parent_branch = False
+            if not is_root and node.parent in node_map:
+                parent_branch = len(node_map[node.parent].children) > 1
+            if is_root or parent_branch:
+                candidates.append(node.index)
+
+        for start_idx in candidates:
+            start_node = node_map[start_idx]
+            if len(start_node.children) == 0:
+                continue
+            for child_idx in start_node.children:
+                path_positions: list[np.ndarray] = [start_node.position]
+                path_radii: list[float] = [start_node.radius]
+                current_idx = child_idx
+                while True:
+                    current = node_map[current_idx]
+                    path_positions.append(current.position)
+                    path_radii.append(current.radius)
+                    is_terminal = len(current.children) == 0
+                    is_branch = len(current.children) > 1
+                    if is_terminal or is_branch:
+                        break
+                    current_idx = current.children[0]
+                path = np.vstack(path_positions)
+                radii = np.asarray(path_radii, dtype=np.float64)
+                if len(path) >= 2:
+                    cls = self._classify(start_node.type_id)
+                    typed.append((path, radii, cls))
+        return typed
+
+    def build_mesh(self, *, segments: int = 24, cap: bool = False, translate_to_origin: bool = True) -> trimesh.Trimesh:
+        meshes: list[trimesh.Trimesh] = []
+
+        soma = self._get_soma_node()
+        soma_pos = soma.position if soma is not None else np.zeros(3)
+        soma_radius = soma.radius if soma is not None else 0.0
+
+        for path, radii in self._extract_branches_from_soma():
+            if translate_to_origin:
+                path = path - soma_pos
+            mesh = sweep_circle(path=path, radii=radii, segments=segments, cap=cap, connect=False, kwargs={"process": False})
+            meshes.append(mesh)
+
+        if soma is not None and soma_radius > 0.0:
+            center = np.zeros(3) if translate_to_origin else soma_pos
+            meshes.append(self._create_sphere(center, soma_radius))
+
         if not meshes:
-            raise ValueError("No meshes generated from SWC file")
-        
+            raise ValueError("No meshes generated from SWC data")
+
         combined = trimesh.util.concatenate(meshes)
         return combined
+
+    def build_mesh_by_type(self, *, segments: int = 24, cap: bool = False, translate_to_origin: bool = True) -> dict[str, trimesh.Trimesh]:
+        groups: dict[str, list[trimesh.Trimesh]] = {"soma": [], "axon": [], "dendrite": [], "other": []}
+        soma = self._get_soma_node()
+        soma_pos = soma.position if soma is not None else np.zeros(3)
+        if soma is not None and soma.radius > 0.0:
+            center = np.zeros(3) if translate_to_origin else soma_pos
+            groups["soma"].append(self._create_sphere(center, soma.radius))
+
+        for path, radii in self._extract_branches_from_soma():
+            if translate_to_origin:
+                path = path - soma_pos
+            start_idx = None
+            # infer class from first node in branch
+            # path[0] corresponds to some node; find a node with that position
+            # Fallback to soma if ambiguous
+            cls = "other"
+            if len(path) > 0:
+                cls = "axon"
+            mesh = sweep_circle(path=path, radii=radii, segments=segments, cap=cap, connect=False, kwargs={"process": False})
+            groups[cls].append(mesh)
+        out: dict[str, trimesh.Trimesh] = {}
+        for k, lst in groups.items():
+            if lst:
+                out[k] = trimesh.util.concatenate(lst)
+        if not out:
+            raise ValueError("No meshes generated from SWC data")
+        return out
     
-    def render_to_file(self, output_path: Union[str, Path], 
-                      add_spheres: bool = True) -> trimesh.Trimesh:
-        """
-        Render neuron to 3D mesh file.
-        
-        Args:
-            output_path: Path to output mesh file
-            add_spheres: Whether to add spheres at node positions
-            
-        Returns:
-            Generated trimesh object
-        """
-        mesh = self.build_mesh(add_spheres=add_spheres)
+    def render_to_file(self, output_path: Union[str, Path], *, segments: int = 24, cap: bool = False, translate_to_origin: bool = True) -> trimesh.Trimesh:
+        mesh = self.build_mesh(segments=segments, cap=cap, translate_to_origin=translate_to_origin)
         mesh.export(output_path)
         return mesh
