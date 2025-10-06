@@ -7,6 +7,9 @@ from setuptools import setup, find_packages
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
+with open("requirements.txt", "r", encoding="utf-8") as fh:
+    requirements = [line.strip() for line in fh if line.strip() and not line.startswith("#")]
+
 setup(
     name="axonet",
     version="0.1.0",
@@ -31,12 +34,7 @@ setup(
         "Topic :: Scientific/Engineering :: Medical Science Apps.",
     ],
     python_requires=">=3.8",
-    install_requires=[
-        "numpy>=1.20.0",
-        "scipy>=1.7.0",
-        "networkx>=2.6.0",
-        "trimesh>=3.9.0",
-    ],
+    install_requires=requirements,
     extras_require={
         "dev": [
             "pytest>=6.0",
