@@ -8,6 +8,7 @@ from typing import Optional, Union
 from pathlib import Path
 from ..core import Neuron
 from ..io import NeuronClass, classify_type_id
+import matplotlib.cm as cm
 from .sweep import sweep_circle
 
 
@@ -227,7 +228,7 @@ class MeshRenderer:
             raise ValueError("No meshes generated from SWC data")
         return out
 
-    def build_scene(self, *, segments: int = 24, cap: bool = False, translate_to_origin: bool = True, glue_union: bool = False) -> trimesh.Scene:
+    def build_scene(self, *, segments: int = 24, cap: bool = False, translate_to_origin: bool = True, glue_union: bool = False, colorize: bool = False, cmap: str = "viridis") -> trimesh.Scene:
         parts = self.build_mesh_by_type(segments=segments, cap=cap, translate_to_origin=translate_to_origin)
         if glue_union:
             # Boolean union per class
@@ -239,7 +240,34 @@ class MeshRenderer:
                     # leave as-is if union fails
                     pass
         scene = trimesh.Scene()
+        color_map = None
+        if colorize:
+            try:
+                color_map = cm.get_cmap(cmap)
+            except Exception:
+                color_map = cm.get_cmap('viridis')
+
+        def _class_color(name: str) -> Optional[np.ndarray]:
+            if color_map is None:
+                return None
+            order = {
+                NeuronClass.SOMA.name: 0.0,
+                NeuronClass.AXON.name: 0.5,
+                NeuronClass.BASAL_DENDRITE.name: 0.75,
+                NeuronClass.APICAL_DENDRITE.name: 1.0,
+                NeuronClass.OTHER.name: 0.25,
+            }
+            t = order.get(name, 0.25)
+            rgba = color_map(t)
+            return (np.array(rgba[:3]) * 255).astype(np.uint8)
+
         for name, mesh in parts.items():
+            if colorize:
+                color = _class_color(name)
+                if color is not None:
+                    # set a uniform vertex color for the mesh
+                    vc = np.tile(color, (len(mesh.vertices), 1))
+                    mesh.visual.vertex_colors = vc
             scene.add_geometry(mesh, node_name=name)
         # Ensure origin at soma already handled by translation
         return scene

@@ -127,11 +127,11 @@ def export_mesh(filepath: str, output: str, segments: int = 24, no_cap: bool = F
     except Exception as e:
         print(f"Error exporting mesh: {e}", file=sys.stderr)
         return 1
-def export_scene(filepath: str, output: str, segments: int = 24, no_cap: bool = True, glue_union: bool = False):
+def export_scene(filepath: str, output: str, segments: int = 24, no_cap: bool = True, glue_union: bool = False, colorize: bool = False, cmap: str = 'viridis'):
     try:
         neuron = load_swc(filepath)
         renderer = MeshRenderer(neuron)
-        scene = renderer.build_scene(segments=segments, cap=(not no_cap), translate_to_origin=True, glue_union=glue_union)
+        scene = renderer.build_scene(segments=segments, cap=(not no_cap), translate_to_origin=True, glue_union=glue_union, colorize=colorize, cmap=cmap)
         output_path = Path(output)
         scene.export(output_path, file_type='glb')
         print(f"Exported scene to {output_path}")
@@ -195,6 +195,8 @@ def main():
     scene_parser.add_argument('--segments', type=int, default=24, help='Segments around branch circumference')
     scene_parser.add_argument('--no-cap', action='store_true', help='Do not cap branch ends')
     scene_parser.add_argument('--glue-union', action='store_true', help='Boolean union per class to glue branches')
+    scene_parser.add_argument('--colorize', action='store_true', help='Apply class colors using matplotlib colormap')
+    scene_parser.add_argument('--cmap', type=str, default='viridis', help='Matplotlib colormap name for colorization')
 
     # 3D viewer command
     viewer_parser = subparsers.add_parser('viewer', help='Launch interactive 3D viewer')
@@ -225,7 +227,7 @@ def main():
     elif args.command == 'mesh':
         return export_mesh(args.input, args.output, args.segments, args.no_cap)
     elif args.command == 'scene':
-        return export_scene(args.input, args.output, args.segments, args.no_cap, args.glue_union)
+        return export_scene(args.input, args.output, args.segments, args.no_cap, args.glue_union, args.colorize, args.cmap)
     elif args.command == 'viewer':
         return view_3d(args.input, args.segments)
     else:
