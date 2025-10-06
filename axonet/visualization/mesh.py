@@ -7,6 +7,7 @@ import trimesh
 from typing import Optional, Union
 from pathlib import Path
 from ..core import Neuron
+from ..io import NeuronClass, classify_type_id
 from .sweep import sweep_circle
 
 
@@ -181,23 +182,29 @@ class MeshRenderer:
         return combined
 
     def build_mesh_by_type(self, *, segments: int = 24, cap: bool = False, translate_to_origin: bool = True) -> dict[str, trimesh.Trimesh]:
-        groups: dict[str, list[trimesh.Trimesh]] = {"soma": [], "axon": [], "dendrite": [], "other": []}
+        groups: dict[str, list[trimesh.Trimesh]] = {
+            NeuronClass.SOMA.name: [],
+            NeuronClass.AXON.name: [],
+            NeuronClass.BASAL_DENDRITE.name: [],
+            NeuronClass.APICAL_DENDRITE.name: [],
+            NeuronClass.OTHER.name: [],
+        }
         soma = self._get_soma_node()
         soma_pos = soma.position if soma is not None else np.zeros(3)
         if soma is not None and soma.radius > 0.0:
             center = np.zeros(3) if translate_to_origin else soma_pos
-            groups["soma"].append(self._create_sphere(center, soma.radius))
+            groups[NeuronClass.SOMA.name].append(self._create_sphere(center, soma.radius))
 
         for path, radii in self._extract_branches_from_soma():
             if translate_to_origin:
                 path = path - soma_pos
-            start_idx = None
-            # infer class from first node in branch
-            # path[0] corresponds to some node; find a node with that position
-            # Fallback to soma if ambiguous
-            cls = "other"
-            if len(path) > 0:
-                cls = "axon"
+            # Determine class from the starting node type
+            # Find the starting node by matching position with tolerance
+            cls_enum = NeuronClass.OTHER
+            start_candidates = [n for n in self.neuron.nodes.values() if np.allclose(n.position, path[0] + (soma_pos if translate_to_origin else 0), atol=1e-9)]
+            if start_candidates:
+                cls_enum = classify_type_id(start_candidates[0].type_id)
+            cls = cls_enum.name
             mesh = sweep_circle(path=path, radii=radii, segments=segments, cap=cap, connect=False, kwargs={"process": False})
             groups[cls].append(mesh)
         out: dict[str, trimesh.Trimesh] = {}
@@ -207,6 +214,23 @@ class MeshRenderer:
         if not out:
             raise ValueError("No meshes generated from SWC data")
         return out
+
+    def build_scene(self, *, segments: int = 24, cap: bool = False, translate_to_origin: bool = True, glue_union: bool = False) -> trimesh.Scene:
+        parts = self.build_mesh_by_type(segments=segments, cap=cap, translate_to_origin=translate_to_origin)
+        if glue_union:
+            # Boolean union per class
+            for key, mesh in list(parts.items()):
+                try:
+                    # union requires watertight meshes; keep fallback
+                    parts[key] = mesh.union(mesh.split(only_watertight=False), engine=None)  # try default engine
+                except Exception:
+                    # leave as-is if union fails
+                    pass
+        scene = trimesh.Scene()
+        for name, mesh in parts.items():
+            scene.add_geometry(mesh, node_name=name)
+        # Ensure origin at soma already handled by translation
+        return scene
     
     def render_to_file(self, output_path: Union[str, Path], *, segments: int = 24, cap: bool = False, translate_to_origin: bool = True) -> trimesh.Trimesh:
         mesh = self.build_mesh(segments=segments, cap=cap, translate_to_origin=translate_to_origin)

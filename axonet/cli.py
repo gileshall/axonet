@@ -124,9 +124,20 @@ def export_mesh(filepath: str, output: str, segments: int = 24, no_cap: bool = F
         mesh = renderer.render_to_file(output, segments=segments, cap=(not no_cap))
         print(f"Exported mesh with {len(mesh.vertices)} vertices and {len(mesh.faces)} faces to {output}")
         return 0
-        
     except Exception as e:
         print(f"Error exporting mesh: {e}", file=sys.stderr)
+        return 1
+def export_scene(filepath: str, output: str, segments: int = 24, no_cap: bool = True, glue_union: bool = False):
+    try:
+        neuron = load_swc(filepath)
+        renderer = MeshRenderer(neuron)
+        scene = renderer.build_scene(segments=segments, cap=(not no_cap), translate_to_origin=True, glue_union=glue_union)
+        output_path = Path(output)
+        scene.export(output_path, file_type='glb')
+        print(f"Exported scene to {output_path}")
+        return 0
+    except Exception as e:
+        print(f"Error exporting scene: {e}", file=sys.stderr)
         return 1
 
 
@@ -177,6 +188,14 @@ def main():
     mesh_parser.add_argument('--segments', type=int, default=24, help='Segments around branch circumference')
     mesh_parser.add_argument('--no-cap', action='store_true', help='Do not cap branch ends')
 
+    # Export scene command (GLB with parts)
+    scene_parser = subparsers.add_parser('scene', help='Export GLB scene with separate parts')
+    scene_parser.add_argument('input', help='Input SWC file')
+    scene_parser.add_argument('output', help='Output .glb file')
+    scene_parser.add_argument('--segments', type=int, default=24, help='Segments around branch circumference')
+    scene_parser.add_argument('--no-cap', action='store_true', help='Do not cap branch ends')
+    scene_parser.add_argument('--glue-union', action='store_true', help='Boolean union per class to glue branches')
+
     # 3D viewer command
     viewer_parser = subparsers.add_parser('viewer', help='Launch interactive 3D viewer')
     viewer_parser.add_argument('input', help='Input SWC file')
@@ -205,6 +224,8 @@ def main():
         return visualize_neuron(args.input, args.size, args.no_color)
     elif args.command == 'mesh':
         return export_mesh(args.input, args.output, args.segments, args.no_cap)
+    elif args.command == 'scene':
+        return export_scene(args.input, args.output, args.segments, args.no_cap, args.glue_union)
     elif args.command == 'viewer':
         return view_3d(args.input, args.segments)
     else:

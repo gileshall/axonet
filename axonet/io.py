@@ -5,7 +5,28 @@ Input/Output utilities for SWC files and other formats.
 import numpy as np
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
+from enum import IntEnum
 from .core import Neuron, SWCNode
+
+
+class NeuronClass(IntEnum):
+    OTHER = 0
+    SOMA = 1
+    AXON = 2
+    BASAL_DENDRITE = 3
+    APICAL_DENDRITE = 4
+
+
+def classify_type_id(type_id: int) -> NeuronClass:
+    if type_id == 1:
+        return NeuronClass.SOMA
+    if type_id == 2:
+        return NeuronClass.AXON
+    if type_id == 3:
+        return NeuronClass.BASAL_DENDRITE
+    if type_id == 4:
+        return NeuronClass.APICAL_DENDRITE
+    return NeuronClass.OTHER
 
 
 class SWCParser:
