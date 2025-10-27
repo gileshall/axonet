@@ -1,5 +1,5 @@
 """
-Command-line interface for AxonNet.
+Command-line interface for Axonet.
 """
 
 import argparse
@@ -141,16 +141,16 @@ def export_scene(filepath: str, output: str, segments: int = 24, no_cap: bool = 
         return 1
 
 
-def view_3d(filepath: str, segments: int = 18):
+def view_3d(filepath: str | None = None, segments: int = 18):
     """Launch interactive 3D viewer."""
     from .visualization.pyglet_swc_viewer import SWCViewer, pyglet
-    _ = SWCViewer(Path(filepath), segments=segments)
+    _ = SWCViewer(Path(filepath) if filepath else None, segments=segments)
     pyglet.app.run()
 
 
 def main():
     """Main CLI entry point."""
-    parser = argparse.ArgumentParser(description="AxonNet: Neuron morphology analysis")
+    parser = argparse.ArgumentParser(description="Axonet: Neuron morphology analysis")
     subparsers = parser.add_subparsers(dest='command', help='Available commands')
     
     # Analyze command
@@ -200,7 +200,7 @@ def main():
 
     # 3D viewer command
     viewer_parser = subparsers.add_parser('viewer', help='Launch interactive 3D viewer')
-    viewer_parser.add_argument('input', help='Input SWC file')
+    viewer_parser.add_argument('input', nargs='?', help='Optional input SWC file')
     viewer_parser.add_argument('--segments', type=int, default=18, help='Segments around branch circumference')
     
     args = parser.parse_args()

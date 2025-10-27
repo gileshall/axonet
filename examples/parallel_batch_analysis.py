@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Parallel batch analysis example using the enhanced AxonNet library.
+Parallel batch analysis example using the enhanced Axonet library.
 """
 
 import sys

@@ -1,5 +1,5 @@
 """
-Setup script for AxonNet library.
+Setup script for Axonet library.
 """
 
 from setuptools import setup, find_packages
@@ -13,7 +13,7 @@ with open("requirements.txt", "r", encoding="utf-8") as fh:
 setup(
     name="axonet",
     version="0.1.0",
-    author="AxonNet Team",
+    author="Axonet Team",
     author_email="",
     description="A comprehensive library for neuron morphology analysis from SWC files",
     long_description=long_description,

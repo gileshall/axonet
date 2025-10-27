@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Basic analysis example using AxonNet library.
+Basic analysis example using Axonet library.
 """
 
 import sys

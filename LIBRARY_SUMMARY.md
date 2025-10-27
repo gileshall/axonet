@@ -1,4 +1,4 @@
-# AxonNet Library - Implementation Summary
+# Axonet Library - Implementation Summary
 
 ## Overview
 Successfully created a comprehensive library for neuron morphology analysis from SWC files, separating concerns into distinct modules and implementing the full analysis framework outlined in `analysis.md`.

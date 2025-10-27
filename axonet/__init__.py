@@ -1,5 +1,5 @@
 """
-AxonNet: A comprehensive library for neuron morphology analysis from SWC files.
+Axonet: A comprehensive library for neuron morphology analysis from SWC files.
 
 This library provides tools for:
 - Loading and parsing SWC files
@@ -15,7 +15,7 @@ from .analysis import MorphologyAnalyzer
 from .visualization import MeshRenderer, ANSIRenderer
 
 __version__ = "0.1.0"
-__author__ = "AxonNet Team"
+__author__ = "Axonet Team"
 
 __all__ = [
     "Neuron",

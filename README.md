@@ -1,4 +1,4 @@
-# AxonNet
+# Axonet
 
 A comprehensive library for neuron morphology analysis from SWC files.
 

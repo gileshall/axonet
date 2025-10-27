@@ -5,3 +5,5 @@ trimesh>=3.9.0
 svgwrite>=1.4.0
 cairosvg>=2.5.0
 pillow>=8.0.0
+matplotlib
+pyglet
