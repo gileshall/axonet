@@ -159,17 +159,40 @@ class MeshRenderer:
                     typed.append((path, radii, cls))
         return typed
 
-    def build_mesh(self, *, segments: int = 24, cap: bool = False, translate_to_origin: bool = True) -> trimesh.Trimesh:
+    def build_mesh(self, *, segments: int = 32, cap: bool = False, translate_to_origin: bool = True, radius_scale: float = 1.0, radius_adaptive_alpha: float = 0.0, radius_ref_percentile: float = 50.0) -> trimesh.Trimesh:
         meshes: list[trimesh.Trimesh] = []
 
         soma = self._get_soma_node()
         soma_pos = soma.position if soma is not None else np.zeros(3)
         soma_radius = soma.radius if soma is not None else 0.0
 
-        for path, radii in self._extract_branches_from_soma():
+        branches = self._extract_branches_from_soma()
+
+        # Compute reference radius across all neurites (exclude soma)
+        ref_radius = None
+        if len(branches) > 0:
+            all_r = np.concatenate([np.asarray(r, dtype=np.float64) for _, r in branches])
+            if all_r.size > 0:
+                q = float(np.clip(radius_ref_percentile, 0.0, 100.0))
+                ref_radius = float(np.percentile(all_r, q))
+
+        for path, radii in branches:
             if translate_to_origin:
                 path = path - soma_pos
-            mesh = sweep_circle(path=path, radii=radii, segments=segments, cap=cap, connect=False, kwargs={"process": False})
+            # Scale neurite radii (soma sphere left unscaled). Optionally adapt scale more for thin neurites.
+            r = np.asarray(radii, dtype=np.float64)
+            if radius_adaptive_alpha > 0.0 and ref_radius is not None and ref_radius > 0.0:
+                # Weight increases as radius gets smaller relative to reference.
+                # weight = (ref/r)^alpha, clamped to avoid extreme boosts.
+                w = (ref_radius / (r + 1e-12)) ** float(radius_adaptive_alpha)
+                w = np.clip(w, 0.0, 10.0)
+                # Convert weight into scale mixing coefficient in [0,1]
+                mix = w / (1.0 + w)
+                scale = 1.0 + (float(radius_scale) - 1.0) * mix
+                radii_scaled = r * scale
+            else:
+                radii_scaled = r * float(radius_scale)
+            mesh = sweep_circle(path=path, radii=radii_scaled, segments=segments, cap=cap, connect=False, kwargs={"process": False})
             meshes.append(mesh)
 
         if soma is not None and soma_radius > 0.0:
@@ -182,7 +205,7 @@ class MeshRenderer:
         combined = trimesh.util.concatenate(meshes)
         return combined
 
-    def build_mesh_by_type(self, *, segments: int = 24, cap: bool = False, translate_to_origin: bool = True) -> dict[str, trimesh.Trimesh]:
+    def build_mesh_by_type(self, *, segments: int = 32, cap: bool = False, translate_to_origin: bool = True, radius_scale: float = 1.0, radius_adaptive_alpha: float = 0.0, radius_ref_percentile: float = 50.0) -> dict[str, trimesh.Trimesh]:
         groups: dict[str, list[trimesh.Trimesh]] = {
             NeuronClass.SOMA.name: [],
             NeuronClass.AXON.name: [],
@@ -196,7 +219,17 @@ class MeshRenderer:
             center = np.zeros(3) if translate_to_origin else soma_pos
             groups[NeuronClass.SOMA.name].append(self._create_sphere(center, soma.radius))
 
-        for path, radii in self._extract_branches_from_soma():
+        branches = self._extract_branches_from_soma()
+
+        # Compute reference radius across all neurites
+        ref_radius = None
+        if len(branches) > 0:
+            all_r = np.concatenate([np.asarray(r, dtype=np.float64) for _, r in branches])
+            if all_r.size > 0:
+                q = float(np.clip(radius_ref_percentile, 0.0, 100.0))
+                ref_radius = float(np.percentile(all_r, q))
+
+        for path, radii in branches:
             if translate_to_origin:
                 path = path - soma_pos
             # Determine class from the starting node type
@@ -218,7 +251,16 @@ class MeshRenderer:
                 if start_node is not None:
                     cls_enum = classify_type_id(start_node.type_id)
             cls = cls_enum.name
-            mesh = sweep_circle(path=path, radii=radii, segments=segments, cap=cap, connect=False, kwargs={"process": False})
+            r = np.asarray(radii, dtype=np.float64)
+            if radius_adaptive_alpha > 0.0 and ref_radius is not None and ref_radius > 0.0:
+                w = (ref_radius / (r + 1e-12)) ** float(radius_adaptive_alpha)
+                w = np.clip(w, 0.0, 10.0)
+                mix = w / (1.0 + w)
+                scale = 1.0 + (float(radius_scale) - 1.0) * mix
+                radii_scaled = r * scale
+            else:
+                radii_scaled = r * float(radius_scale)
+            mesh = sweep_circle(path=path, radii=radii_scaled, segments=segments, cap=cap, connect=False, kwargs={"process": False})
             groups[cls].append(mesh)
         out: dict[str, trimesh.Trimesh] = {}
         for k, lst in groups.items():
@@ -228,8 +270,8 @@ class MeshRenderer:
             raise ValueError("No meshes generated from SWC data")
         return out
 
-    def build_scene(self, *, segments: int = 24, cap: bool = False, translate_to_origin: bool = True, glue_union: bool = False, colorize: bool = False, cmap: str = "viridis") -> trimesh.Scene:
-        parts = self.build_mesh_by_type(segments=segments, cap=cap, translate_to_origin=translate_to_origin)
+    def build_scene(self, *, segments: int = 32, cap: bool = False, translate_to_origin: bool = True, glue_union: bool = False, colorize: bool = False, cmap: str = "viridis", radius_scale: float = 1.0, radius_adaptive_alpha: float = 0.0, radius_ref_percentile: float = 50.0) -> trimesh.Scene:
+        parts = self.build_mesh_by_type(segments=segments, cap=cap, translate_to_origin=translate_to_origin, radius_scale=radius_scale, radius_adaptive_alpha=radius_adaptive_alpha, radius_ref_percentile=radius_ref_percentile)
         if glue_union:
             # Boolean union per class
             for key, mesh in list(parts.items()):
@@ -272,7 +314,7 @@ class MeshRenderer:
         # Ensure origin at soma already handled by translation
         return scene
     
-    def render_to_file(self, output_path: Union[str, Path], *, segments: int = 24, cap: bool = False, translate_to_origin: bool = True) -> trimesh.Trimesh:
-        mesh = self.build_mesh(segments=segments, cap=cap, translate_to_origin=translate_to_origin)
+    def render_to_file(self, output_path: Union[str, Path], *, segments: int = 32, cap: bool = False, translate_to_origin: bool = True, radius_scale: float = 1.0, radius_adaptive_alpha: float = 0.0, radius_ref_percentile: float = 50.0) -> trimesh.Trimesh:
+        mesh = self.build_mesh(segments=segments, cap=cap, translate_to_origin=translate_to_origin, radius_scale=radius_scale, radius_adaptive_alpha=radius_adaptive_alpha, radius_ref_percentile=radius_ref_percentile)
         mesh.export(output_path)
         return mesh

@@ -7,3 +7,4 @@ cairosvg>=2.5.0
 pillow>=8.0.0
 matplotlib
 pyglet
+imageio

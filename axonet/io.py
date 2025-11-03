@@ -115,14 +115,15 @@ def load_swc(filepath: Union[str, Path], validate: bool = True) -> Neuron:
         raise ValueError(f"No valid nodes found in {filepath}")
     
     if validate:
-        _validate_swc_data(nodes)
+        _validate_swc_data(nodes, filepath)
     
     return Neuron(nodes, metadata)
 
 
-def _validate_swc_data(nodes: List[SWCNode]) -> None:
+def _validate_swc_data(nodes: List[SWCNode], filepath: Union[str, Path] = None) -> None:
     """Validate SWC data for common issues."""
     node_indices = {node.index for node in nodes}
+    filename = Path(filepath).name if filepath else "unknown file"
     
     # Check for root node
     root_nodes = [node for node in nodes if node.parent == -1]
@@ -130,17 +131,17 @@ def _validate_swc_data(nodes: List[SWCNode]) -> None:
         raise ValueError("No root node found (parent = -1)")
     
     if len(root_nodes) > 1:
-        print(f"Warning: Multiple root nodes found: {[n.index for n in root_nodes]}")
+        print(f"Warning [{filename}]: Multiple root nodes found: {[n.index for n in root_nodes]}")
     
     # Check for orphaned nodes
     for node in nodes:
         if node.parent != -1 and node.parent not in node_indices:
-            print(f"Warning: Node {node.index} has invalid parent {node.parent}")
+            print(f"Warning [{filename}]: Node {node.index} has invalid parent {node.parent}")
     
     # Check for self-loops
     for node in nodes:
         if node.parent == node.index:
-            print(f"Warning: Node {node.index} has self-loop")
+            print(f"Warning [{filename}]: Node {node.index} has self-loop")
 
 
 def save_swc(neuron: Neuron, filepath: Union[str, Path]) -> None:
