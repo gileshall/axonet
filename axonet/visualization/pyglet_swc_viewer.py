@@ -33,7 +33,7 @@ MMB drag        : Pan (or Shift+LMB)
 Wheel           : Dolly zoom (exponential, cursor-aware)
 R               : Reset view (re-fit)
 W               : Toggle wireframe
-O               : Toggle depth shading
+O               : Cycle depth view (normal / shading overlay / depth map)
 C               : Toggle per-compartment color / single tint
 P               : Toggle perspective / orthographic
 F               : File browser
@@ -80,13 +80,19 @@ in float v_viewz;
 uniform vec3 u_camera;
 uniform vec3 u_light_dir; // normalized in world space
 uniform vec3 u_color;
-uniform int  u_depth_enabled;
+uniform int  u_depth_mode; // 0=normal, 1=depth shading overlay, 2=depth view (grayscale)
 uniform float u_depth_near;
 uniform float u_depth_far;
 
 out vec4 FragColor;
 
 void main(){
+    if (u_depth_mode == 2){
+        float d = clamp(((-v_viewz) - u_depth_near) / max(1e-6, (u_depth_far - u_depth_near)), 0.0, 1.0);
+        FragColor = vec4(d, d, d, 1.0);
+        return;
+    }
+
     vec3 N = normalize(v_nrm);
     vec3 L = normalize(u_light_dir);
     vec3 V = normalize(u_camera - v_world);
@@ -98,13 +104,12 @@ void main(){
     vec3 base = u_color;
     vec3 color = 0.12 * base + 0.88 * diff * base + 0.25 * spec * vec3(1.0);
 
-    if (u_depth_enabled == 1){
+    if (u_depth_mode == 1){
         float zn = clamp(((-v_viewz) - u_depth_near) / max(1e-6, (u_depth_far - u_depth_near)), 0.0, 1.0);
         float shade = mix(0.45, 1.0, 1.0 - zn);
         color *= shade;
     }
 
-    // Output in linear; rely on sRGB framebuffer if available
     FragColor = vec4(color, 1.0);
 }
 """
@@ -284,7 +289,7 @@ class SWCViewer(pyglet.window.Window):
         self.uni_cam = gl.glGetUniformLocation(self.program, b"u_camera")
         self.uni_light = gl.glGetUniformLocation(self.program, b"u_light_dir")
         self.uni_color = gl.glGetUniformLocation(self.program, b"u_color")
-        self.uni_depth_enabled = gl.glGetUniformLocation(self.program, b"u_depth_enabled")
+        self.uni_depth_mode = gl.glGetUniformLocation(self.program, b"u_depth_mode")
         self.uni_depth_near = gl.glGetUniformLocation(self.program, b"u_depth_near")
         self.uni_depth_far = gl.glGetUniformLocation(self.program, b"u_depth_far")
 
@@ -319,7 +324,7 @@ class SWCViewer(pyglet.window.Window):
 
         # Render options
         self.is_wireframe = False
-        self.depth_shading = False
+        self.depth_mode = 0  # 0=normal, 1=depth shading overlay, 2=depth view (grayscale)
         self.color_mode = 0  # 0 = single tint, 1 = by type
 
         # HUD + UI
@@ -519,7 +524,7 @@ class SWCViewer(pyglet.window.Window):
         light_dir = light_dir / (np.linalg.norm(light_dir) + 1e-12)
         gl.glUniform3f(self.uni_light, float(light_dir[0]), float(light_dir[1]), float(light_dir[2]))
 
-        gl.glUniform1i(self.uni_depth_enabled, 1 if self.depth_shading else 0)
+        gl.glUniform1i(self.uni_depth_mode, self.depth_mode)
         gl.glUniform1f(self.uni_depth_near, float(self.near))
         gl.glUniform1f(self.uni_depth_far, float(self.far))
 
@@ -620,7 +625,7 @@ class SWCViewer(pyglet.window.Window):
 
         add('Open…', lambda: self._toggle_browser())
         add('By Color', lambda: self._cycle_color())
-        add('Depth Shade', lambda: self._toggle_depth())
+        add('Depth View', lambda: self._toggle_depth())
         add('Wireframe', lambda: self._toggle_wire())
         add('Ortho/Persp', lambda: self._toggle_proj())
         add('Soma', lambda: self._toggle_layer(NeuronClass.SOMA.name))
@@ -655,7 +660,7 @@ class SWCViewer(pyglet.window.Window):
         self.color_mode = (self.color_mode + 1) % 2
 
     def _toggle_depth(self):
-        self.depth_shading = not self.depth_shading
+        self.depth_mode = (self.depth_mode + 1) % 3
 
     def _toggle_wire(self):
         self.is_wireframe = not self.is_wireframe

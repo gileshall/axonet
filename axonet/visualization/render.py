@@ -39,7 +39,6 @@ from typing import Dict, Iterable, Optional, Tuple, Union
 import numpy as np
 import pyglet
 from pyglet import gl
-from pyglet.window.key import V
 
 # ---- Project-local imports ----
 from .mesh import MeshRenderer
@@ -59,6 +58,83 @@ COLORS = {
 }
 
 # ============================ Math helpers ============================
+
+def majority_pool_uint8(mask_hi: np.ndarray, factor: int, *, prefer_nonzero: bool = True) -> np.ndarray:
+    """Downsample (H*factor, W*factor) -> (H, W) by majority voting within each factor×factor block.
+    
+    Args:
+        mask_hi: uint8 array of shape (H*factor, W*factor)
+        factor: Downsampling factor (must divide image dimensions)
+        prefer_nonzero: If True, prefer nonzero labels over background (0) in ties
+    
+    Returns:
+        uint8 array of shape (H, W) with majority vote per block
+    """
+    Hh, Wh = mask_hi.shape
+    assert Hh % factor == 0 and Wh % factor == 0, f"Supersample factor {factor} must divide image size ({Hh}, {Wh})"
+    H, W = Hh // factor, Wh // factor
+
+    blocks = mask_hi.reshape(H, factor, W, factor)
+    blocks = np.transpose(blocks, (0, 2, 1, 3)).reshape(H, W, factor * factor)
+
+    out = np.zeros((H, W), dtype=np.uint8)
+
+    for i in range(H):
+        row = blocks[i]
+        for j in range(W):
+            vals = row[j]
+            if prefer_nonzero:
+                nz = vals[vals != 0]
+                if nz.size:
+                    uniq, counts = np.unique(nz, return_counts=True)
+                    winner = uniq[np.argmax(counts)]
+                    out[i, j] = winner
+                    continue
+                out[i, j] = 0
+            else:
+                uniq, counts = np.unique(vals, return_counts=True)
+                arg = np.argmax(counts)
+                maxc = counts[arg]
+                winner = np.min(uniq[counts == maxc])
+                out[i, j] = winner
+
+    return out
+
+def average_pool_depth(depth_hi: np.ndarray, factor: int, *, prefer_valid: bool = True, background_threshold: float = 0.999) -> np.ndarray:
+    """Downsample (H*factor, W*factor) -> (H, W) by averaging depth within each factor×factor block.
+    
+    Args:
+        depth_hi: float32 array of shape (H*factor, W*factor) with depth values in [0, 1]
+        factor: Downsampling factor (must divide image dimensions)
+        prefer_valid: If True, prefer valid depth values over background in averaging
+        background_threshold: Values >= this threshold are considered background
+    
+    Returns:
+        float32 array of shape (H, W) with averaged depth per block
+    """
+    Hh, Wh = depth_hi.shape
+    assert Hh % factor == 0 and Wh % factor == 0, f"Supersample factor {factor} must divide image size ({Hh}, {Wh})"
+    H, W = Hh // factor, Wh // factor
+
+    blocks = depth_hi.reshape(H, factor, W, factor)
+    blocks = np.transpose(blocks, (0, 2, 1, 3)).reshape(H, W, factor * factor)
+
+    out = np.zeros((H, W), dtype=np.float32)
+
+    for i in range(H):
+        row = blocks[i]
+        for j in range(W):
+            vals = row[j]
+            if prefer_valid:
+                valid = vals[vals < background_threshold]
+                if valid.size > 0:
+                    out[i, j] = np.mean(valid)
+                else:
+                    out[i, j] = np.mean(vals)
+            else:
+                out[i, j] = np.mean(vals)
+
+    return out
 
 def perspective(fovy_deg: float, aspect: float, znear: float, zfar: float) -> np.ndarray:
     f = 1.0 / math.tan(math.radians(fovy_deg) * 0.5)
@@ -96,12 +172,6 @@ def look_at(eye: np.ndarray, target: np.ndarray, up: np.ndarray) -> np.ndarray:
     return m
 
 
-def normal_matrix(model: np.ndarray, view: np.ndarray) -> np.ndarray:
-    mv = (view @ model)[:3, :3]
-    invT = np.linalg.inv(mv).T
-    return invT.astype(np.float32)
-
-
 def _axis_angle_matrix(axis: np.ndarray, angle: float) -> np.ndarray:
     x, y, z = axis
     c = math.cos(angle)
@@ -130,21 +200,15 @@ def _aabb_corners(bmin: np.ndarray, bmax: np.ndarray) -> np.ndarray:
 VERT_SRC = b"""
 #version 330 core
 layout(location=0) in vec3 position;
-layout(location=1) in vec3 normal;
 
 uniform mat4 u_model;
 uniform mat4 u_view;
 uniform mat4 u_proj;
-uniform mat3 u_normal_mat;
 
-out vec3 v_nrm;
-out vec3 v_world;
 flat out float v_viewz;
 
 void main(){
     vec4 world = u_model * vec4(position, 1.0);
-    v_world = world.xyz;
-    v_nrm = normalize(u_normal_mat * normal);
     vec4 viewpos = u_view * world;
     v_viewz = viewpos.z;
     gl_Position = u_proj * viewpos;
@@ -153,16 +217,12 @@ void main(){
 
 FRAG_SRC_RGBA = b"""
 #version 330 core
-in vec3 v_nrm;
-in vec3 v_world;
 flat in float v_viewz;
 
-uniform vec3 u_camera;
 uniform vec3 u_color;
 uniform float u_depth_near;
 uniform float u_depth_far;
 uniform int  u_render_mode; // 0=color, 1=depth-to-color
-uniform int  u_class_id;    // class id for mask mode (0-255)
 
 out vec4 FragColor;
 
@@ -180,15 +240,8 @@ void main(){
 
 FRAG_SRC_INTEGER = b"""
 #version 330 core
-in vec3 v_nrm;
-in vec3 v_world;
-flat in float v_viewz;
 
-uniform vec3 u_camera;
-uniform vec3 u_color;
-uniform float u_depth_near;
-uniform float u_depth_far;
-uniform int  u_class_id;    // class id for mask mode (0-255)
+uniform int u_class_id;  // class id for mask mode (0-255)
 
 out uint FragColor;  // Single uint output for integer IDs
 
@@ -394,32 +447,6 @@ class OffscreenContext:
         gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, 0)
         return int(fbo.value), int(color_tex.value), int(depth_rbo.value)
 
-    def create_resolve_fbo(self) -> Tuple[int, int]:
-        """Create single-sample FBO for MSAA resolve.
-        Returns (fbo_id, color_tex_id).
-        """
-        fbo = gl.GLuint()
-        gl.glGenFramebuffers(1, ctypes.byref(fbo))
-        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, fbo)
-        
-        color_tex = gl.GLuint()
-        gl.glGenTextures(1, ctypes.byref(color_tex))
-        gl.glBindTexture(gl.GL_TEXTURE_2D, color_tex)
-        gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_R8UI, self.width, self.height, 0, 
-                       gl.GL_RED_INTEGER, gl.GL_UNSIGNED_BYTE, None)
-        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_NEAREST)
-        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_NEAREST)
-        gl.glFramebufferTexture2D(gl.GL_FRAMEBUFFER, gl.GL_COLOR_ATTACHMENT0, 
-                                gl.GL_TEXTURE_2D, color_tex, 0)
-        
-        status = gl.glCheckFramebufferStatus(gl.GL_FRAMEBUFFER)
-        if status != gl.GL_FRAMEBUFFER_COMPLETE:
-            raise RuntimeError(f"Resolve FBO incomplete: {status}")
-        
-        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, 0)
-        return int(fbo.value), int(color_tex.value)
-
-
 class NeuroRenderCore:
     """UI-agnostic renderer for SWC neurons.
 
@@ -441,38 +468,26 @@ class NeuroRenderCore:
         self.uni_model_rgba = gl.glGetUniformLocation(self.program_rgba, b"u_model")
         self.uni_view_rgba = gl.glGetUniformLocation(self.program_rgba, b"u_view")
         self.uni_proj_rgba = gl.glGetUniformLocation(self.program_rgba, b"u_proj")
-        self.uni_normal_rgba = gl.glGetUniformLocation(self.program_rgba, b"u_normal_mat")
-        self.uni_cam_rgba = gl.glGetUniformLocation(self.program_rgba, b"u_camera")
         self.uni_color_rgba = gl.glGetUniformLocation(self.program_rgba, b"u_color")
         self.uni_depth_near_rgba = gl.glGetUniformLocation(self.program_rgba, b"u_depth_near")
         self.uni_depth_far_rgba = gl.glGetUniformLocation(self.program_rgba, b"u_depth_far")
         self.uni_render_mode_rgba = gl.glGetUniformLocation(self.program_rgba, b"u_render_mode")
-        self.uni_class_id_rgba = gl.glGetUniformLocation(self.program_rgba, b"u_class_id")
 
         # Integer program uniforms
         self.uni_model_int = gl.glGetUniformLocation(self.program_integer, b"u_model")
         self.uni_view_int = gl.glGetUniformLocation(self.program_integer, b"u_view")
         self.uni_proj_int = gl.glGetUniformLocation(self.program_integer, b"u_proj")
-        self.uni_normal_int = gl.glGetUniformLocation(self.program_integer, b"u_normal_mat")
-        self.uni_cam_int = gl.glGetUniformLocation(self.program_integer, b"u_camera")
-        self.uni_color_int = gl.glGetUniformLocation(self.program_integer, b"u_color")
-        self.uni_depth_near_int = gl.glGetUniformLocation(self.program_integer, b"u_depth_near")
-        self.uni_depth_far_int = gl.glGetUniformLocation(self.program_integer, b"u_depth_far")
         self.uni_class_id_int = gl.glGetUniformLocation(self.program_integer, b"u_class_id")
 
         # buffers
         self.vao = gl.GLuint()
         gl.glGenVertexArrays(1, ctypes.byref(self.vao))
         gl.glBindVertexArray(self.vao)
-        self.vbo_pos = gl.GLuint(); self.vbo_nrm = gl.GLuint()
+        self.vbo_pos = gl.GLuint()
         gl.glGenBuffers(1, ctypes.byref(self.vbo_pos))
-        gl.glGenBuffers(1, ctypes.byref(self.vbo_nrm))
         gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.vbo_pos)
         gl.glEnableVertexAttribArray(0)
         gl.glVertexAttribPointer(0, 3, gl.GL_FLOAT, gl.GL_FALSE, 0, ctypes.c_void_p(0))
-        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.vbo_nrm)
-        gl.glEnableVertexAttribArray(1)
-        gl.glVertexAttribPointer(1, 3, gl.GL_FLOAT, gl.GL_FALSE, 0, ctypes.c_void_p(0))
         gl.glBindBuffer(gl.GL_ARRAY_BUFFER, 0)
 
         # scene data
@@ -515,9 +530,8 @@ class NeuroRenderCore:
         # cached CPU arrays for QC if needed
         self._pos_cpu: Optional[np.ndarray] = None
         
-        # FBOs for integer rendering
+        # FBO for integer rendering
         self._integer_fbo: Optional[Tuple[int, int, int]] = None
-        self._resolve_fbo: Optional[Tuple[int, int]] = None
 
     # ------------------------- Data / geometry -------------------------
     def load_swc(self, path: Path, *, segments: int = 18, radius_scale: float = 1.0, radius_adaptive_alpha: float = 0.0, radius_ref_percentile: float = 50.0) -> None:
@@ -539,7 +553,6 @@ class NeuroRenderCore:
 
         self.draw_ranges.clear()
         positions = []
-        normals = []
         bmin = None; bmax = None
         start = 0
         for cls in order:
@@ -548,12 +561,9 @@ class NeuroRenderCore:
                 continue
             v = np.asarray(m.vertices, dtype=np.float32)
             f = np.asarray(m.faces, dtype=np.int32)
-            vn = np.asarray(m.vertex_normals if m.vertex_normals is not None else m.face_normals.repeat(3, axis=0), dtype=np.float32)
             tri_count = f.shape[0]
             pos = v[f.reshape(-1)]
-            nrm = vn[f.reshape(-1)]
             positions.append(pos)
-            normals.append(nrm)
             count = int(tri_count * 3)
             self.draw_ranges.append(DrawRange(start, count, self._cls_colors[cls], cls))
             start += count
@@ -566,20 +576,15 @@ class NeuroRenderCore:
             raise RuntimeError("No mesh data generated from neuron!")
 
         pos_all = np.concatenate(positions, axis=0)
-        nrm_all = np.concatenate(normals, axis=0)
         self.vertex_count = int(pos_all.shape[0])
         self.bounds_min = bmin
         self.bounds_max = bmax
         self.center = 0.5 * (bmin + bmax)
         self.diag = float(np.linalg.norm(bmax - bmin))
 
-        # upload
         gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.vbo_pos)
         buf_t = (gl.GLfloat * pos_all.size)
         gl.glBufferData(gl.GL_ARRAY_BUFFER, pos_all.nbytes, buf_t.from_buffer(pos_all), gl.GL_STATIC_DRAW)
-        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.vbo_nrm)
-        nrm_t = (gl.GLfloat * nrm_all.size)
-        gl.glBufferData(gl.GL_ARRAY_BUFFER, nrm_all.nbytes, nrm_t.from_buffer(nrm_all), gl.GL_STATIC_DRAW)
         gl.glBindBuffer(gl.GL_ARRAY_BUFFER, 0)
 
         # cache for QC if you prefer sampling vertices instead of AABB corners
@@ -707,13 +712,10 @@ class NeuroRenderCore:
         V = self.camera.view()
         P = self._compute_projection()
         M = np.eye(4, dtype=np.float32)
-        N = normal_matrix(M, V)
 
         gl.glUniformMatrix4fv(self.uni_model_rgba, 1, gl.GL_TRUE, _as_glmat(M))
         gl.glUniformMatrix4fv(self.uni_view_rgba, 1, gl.GL_TRUE, _as_glmat(V))
         gl.glUniformMatrix4fv(self.uni_proj_rgba, 1, gl.GL_TRUE, _as_glmat(P))
-        gl.glUniformMatrix3fv(self.uni_normal_rgba, 1, gl.GL_TRUE, (gl.GLfloat * 9)(*N.flatten()))
-        gl.glUniform3f(self.uni_cam_rgba, float(self.camera.eye[0]), float(self.camera.eye[1]), float(self.camera.eye[2]))
         gl.glUniform1f(self.uni_depth_near_rgba, float(self.camera.near))
         gl.glUniform1f(self.uni_depth_far_rgba, float(self.camera.far))
         gl.glUniform1i(self.uni_render_mode_rgba, config.mode.value)
@@ -723,15 +725,10 @@ class NeuroRenderCore:
         V = self.camera.view()
         P = self._compute_projection()
         M = np.eye(4, dtype=np.float32)
-        N = normal_matrix(M, V)
 
         gl.glUniformMatrix4fv(self.uni_model_int, 1, gl.GL_TRUE, _as_glmat(M))
         gl.glUniformMatrix4fv(self.uni_view_int, 1, gl.GL_TRUE, _as_glmat(V))
         gl.glUniformMatrix4fv(self.uni_proj_int, 1, gl.GL_TRUE, _as_glmat(P))
-        gl.glUniformMatrix3fv(self.uni_normal_int, 1, gl.GL_TRUE, (gl.GLfloat * 9)(*N.flatten()))
-        gl.glUniform3f(self.uni_cam_int, float(self.camera.eye[0]), float(self.camera.eye[1]), float(self.camera.eye[2]))
-        gl.glUniform1f(self.uni_depth_near_int, float(self.camera.near))
-        gl.glUniform1f(self.uni_depth_far_int, float(self.camera.far))
 
     def render(self, config: RenderConfig) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
         """Unified render method with different strategies."""
@@ -811,16 +808,12 @@ class NeuroRenderCore:
         return depth01
 
     def _render_integer_ids(self, config: RenderConfig) -> np.ndarray:
-        """Render class IDs to integer FBO with MSAA-safe resolve."""
+        """Render class IDs to integer FBO (single-sample)."""
         if self._integer_fbo is None:
             self._integer_fbo = self.ctx.create_integer_fbo()
-        if self._resolve_fbo is None:
-            self._resolve_fbo = self.ctx.create_resolve_fbo()
         
         msaa_fbo, msaa_tex, msaa_depth = self._integer_fbo
-        resolve_fbo, resolve_tex = self._resolve_fbo
         
-        # Render to MSAA integer FBO
         gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, msaa_fbo)
         gl.glViewport(0, 0, self.ctx.width, self.ctx.height)
         
@@ -861,39 +854,200 @@ class NeuroRenderCore:
         
         self._restore_render_state(srgb_enabled, blend_enabled, cull_enabled)
         return mask
-    def render_rgba(self, *, background=(0.0, 0.0, 0.0, 0.0), also_return_depth=False) -> Union[np.ndarray, tuple]:
+
+    def render_rgba(self, *, background=(0.0, 0.0, 0.0, 0.0), also_return_depth=False, depth_factor: int = 2) -> Union[np.ndarray, tuple]:
         """Render current scene to RGBA8 numpy array [H, W, 4].
         If also_return_depth=True, returns (rgba, depth) as tuple.
+        
+        Args:
+            background: Background color as (R, G, B, A) tuple
+            also_return_depth: If True, also return depth map
+            depth_factor: Supersampling factor for depth (2, 3, or 4 recommended)
         """
         config = RenderConfig(mode=RenderMode.COLOR, background=background)
         rgba = self.render(config)
         
         if also_return_depth:
-            depth_config = RenderConfig(mode=RenderMode.DEPTH_TO_COLOR, background=(0.0, 0.0, 0.0, 0.0), 
-                                      disable_srgb=True, disable_blend=True, disable_cull=True)
-            depth = self.render(depth_config)
+            depth = self.render_depth(factor=depth_factor)
             return rgba, depth
         return rgba
     
-    def read_depth(self) -> np.ndarray:
-        """Read depth from the current framebuffer (must be called after a render)."""
-        depth_buffer = (gl.GLfloat * (self.ctx.width * self.ctx.height))()
-        gl.glReadPixels(0, 0, self.ctx.width, self.ctx.height, gl.GL_DEPTH_COMPONENT, gl.GL_FLOAT, depth_buffer)
-        depth = np.frombuffer(depth_buffer, dtype=np.float32).reshape(self.ctx.height, self.ctx.width)
-        depth = np.flipud(depth)
-        return depth
+    def render_depth(self, *, factor: int = 2) -> np.ndarray:
+        """Render depth map to numpy array [H, W] in [0, 1] with supersampling.
+        
+        Args:
+            factor: Supersampling factor (2, 3, or 4 recommended). If factor=1, uses single-sample.
+        
+        Returns:
+            float32 array of shape (H, W) with depth values in [0, 1]
+        """
+        factor = int(max(1, factor))
+        if factor == 1:
+            config = RenderConfig(mode=RenderMode.DEPTH_TO_COLOR, background=(0.0, 0.0, 0.0, 0.0),
+                                disable_srgb=True, disable_blend=True, disable_cull=True)
+            return self.render(config)
+        return self._render_depth_supersampled(factor)
 
-    def render_depth(self) -> np.ndarray:
-        """Render depth map to numpy array [H, W] in [0, 1] using color output."""
+    def _render_depth_supersampled(self, factor: int) -> np.ndarray:
+        """Render depth at (W*factor, H*factor) then average-pool down to (H, W)."""
+        W, H = self.ctx.width, self.ctx.height
+        Whi, Hhi = W * factor, H * factor
+
+        fbo = gl.GLuint()
+        gl.glGenFramebuffers(1, ctypes.byref(fbo))
+        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, fbo)
+
+        color_tex = gl.GLuint()
+        gl.glGenTextures(1, ctypes.byref(color_tex))
+        gl.glBindTexture(gl.GL_TEXTURE_2D, color_tex)
+        gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_RGBA8, Whi, Hhi, 0, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, None)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_NEAREST)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_NEAREST)
+        gl.glFramebufferTexture2D(gl.GL_FRAMEBUFFER, gl.GL_COLOR_ATTACHMENT0, gl.GL_TEXTURE_2D, color_tex, 0)
+
+        depth_rbo = gl.GLuint()
+        gl.glGenRenderbuffers(1, ctypes.byref(depth_rbo))
+        gl.glBindRenderbuffer(gl.GL_RENDERBUFFER, depth_rbo)
+        gl.glRenderbufferStorage(gl.GL_RENDERBUFFER, gl.GL_DEPTH_COMPONENT24, Whi, Hhi)
+        gl.glFramebufferRenderbuffer(gl.GL_FRAMEBUFFER, gl.GL_DEPTH_ATTACHMENT, gl.GL_RENDERBUFFER, depth_rbo)
+
+        status = gl.glCheckFramebufferStatus(gl.GL_FRAMEBUFFER)
+        if status != gl.GL_FRAMEBUFFER_COMPLETE:
+            raise RuntimeError(f"Supersampled depth FBO incomplete: {status}")
+
+        gl.glViewport(0, 0, Whi, Hhi)
+        gl.glClearColor(0.0, 0.0, 0.0, 0.0)
+        gl.glClear(gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT)
+
+        prev_aspect = self.aspect
+        self.aspect = max(1e-6, Whi / float(Hhi))
+
         config = RenderConfig(mode=RenderMode.DEPTH_TO_COLOR, background=(0.0, 0.0, 0.0, 0.0),
                             disable_srgb=True, disable_blend=True, disable_cull=True)
-        return self.render(config)
+        srgb_enabled, blend_enabled, cull_enabled = self._setup_render_state(config)
+
+        gl.glBindVertexArray(self.vao)
+        gl.glUseProgram(self.program_rgba)
+        gl.glPolygonMode(gl.GL_FRONT_AND_BACK, gl.GL_FILL)
+        self._setup_uniforms_rgba(config)
+
+        for dr in self.draw_ranges:
+            if not self.layer_visible.get(dr.cls, True):
+                continue
+            gl.glUniform3f(self.uni_color_rgba, 1.0, 1.0, 1.0)
+            gl.glDrawArrays(gl.GL_TRIANGLES, dr.start, dr.count)
+
+        gl.glFinish()
+
+        buf = (gl.GLubyte * (Whi * Hhi * 4))()
+        gl.glReadPixels(0, 0, Whi, Hhi, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, buf)
+        img = np.frombuffer(buf, dtype=np.uint8).reshape(Hhi, Whi, 4)
+        img = np.flipud(img)
+        depth_hi = img[..., 0].astype(np.float32) / 255.0
+
+        gl.glViewport(0, 0, self.ctx.width, self.ctx.height)
+        self._restore_render_state(srgb_enabled, blend_enabled, cull_enabled)
+        self.aspect = prev_aspect
+
+        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, 0)
+        gl.glDeleteFramebuffers(1, ctypes.byref(fbo))
+        gl.glDeleteTextures(1, ctypes.byref(color_tex))
+        gl.glDeleteRenderbuffers(1, ctypes.byref(depth_rbo))
+
+        return average_pool_depth(depth_hi, factor, prefer_valid=True)
 
     def render_class_id_mask_msaa_safe(self, class_to_id: Dict[str, int]) -> np.ndarray:
         """Render per-pixel class id mask using integer FBO with MSAA-safe resolve."""
         config = RenderConfig(mode=RenderMode.CLASS_ID_INTEGER, background=(0.0, 0.0, 0.0, 0.0),
                             class_to_id=class_to_id, disable_srgb=True, disable_blend=True, disable_cull=True)
         return self.render(config)
+
+    def _render_integer_ids_supersampled(self, class_to_id: Dict[str, int], factor: int) -> np.ndarray:
+        """Render integer classes at (W*factor, H*factor) then majority-pool down to (H, W)."""
+        W, H = self.ctx.width, self.ctx.height
+        Whi, Hhi = W * factor, H * factor
+
+        fbo = gl.GLuint()
+        gl.glGenFramebuffers(1, ctypes.byref(fbo))
+        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, fbo)
+
+        color_tex = gl.GLuint()
+        gl.glGenTextures(1, ctypes.byref(color_tex))
+        gl.glBindTexture(gl.GL_TEXTURE_2D, color_tex)
+        gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_R8UI, Whi, Hhi, 0, gl.GL_RED_INTEGER, gl.GL_UNSIGNED_BYTE, None)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_NEAREST)
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_NEAREST)
+        gl.glFramebufferTexture2D(gl.GL_FRAMEBUFFER, gl.GL_COLOR_ATTACHMENT0, gl.GL_TEXTURE_2D, color_tex, 0)
+
+        depth_rbo = gl.GLuint()
+        gl.glGenRenderbuffers(1, ctypes.byref(depth_rbo))
+        gl.glBindRenderbuffer(gl.GL_RENDERBUFFER, depth_rbo)
+        gl.glRenderbufferStorage(gl.GL_RENDERBUFFER, gl.GL_DEPTH_COMPONENT24, Whi, Hhi)
+        gl.glFramebufferRenderbuffer(gl.GL_FRAMEBUFFER, gl.GL_DEPTH_ATTACHMENT, gl.GL_RENDERBUFFER, depth_rbo)
+
+        status = gl.glCheckFramebufferStatus(gl.GL_FRAMEBUFFER)
+        if status != gl.GL_FRAMEBUFFER_COMPLETE:
+            raise RuntimeError(f"Supersampled integer FBO incomplete: {status}")
+
+        gl.glViewport(0, 0, Whi, Hhi)
+
+        clear_value = (gl.GLuint * 4)(0, 0, 0, 0)
+        gl.glClearBufferuiv(gl.GL_COLOR, 0, clear_value)
+        gl.glClear(gl.GL_DEPTH_BUFFER_BIT)
+
+        prev_aspect = self.aspect
+        self.aspect = max(1e-6, Whi / float(Hhi))
+
+        config = RenderConfig(mode=RenderMode.CLASS_ID_INTEGER, background=(0.0, 0.0, 0.0, 0.0),
+                            class_to_id=class_to_id, disable_srgb=True, disable_blend=True, disable_cull=True)
+        srgb_enabled, blend_enabled, cull_enabled = self._setup_render_state(config)
+
+        gl.glBindVertexArray(self.vao)
+        gl.glUseProgram(self.program_integer)
+        gl.glPolygonMode(gl.GL_FRONT_AND_BACK, gl.GL_FILL)
+        self._setup_uniforms_integer(config)
+
+        for dr in self.draw_ranges:
+            if not self.layer_visible.get(dr.cls, True):
+                continue
+            cid = int(class_to_id.get(dr.cls, 0))
+            cid = max(0, min(255, cid))
+            gl.glUniform1i(self.uni_class_id_int, cid)
+            gl.glDrawArrays(gl.GL_TRIANGLES, dr.start, dr.count)
+
+        gl.glFinish()
+
+        buf = (gl.GLubyte * (Whi * Hhi))()
+        gl.glReadPixels(0, 0, Whi, Hhi, gl.GL_RED_INTEGER, gl.GL_UNSIGNED_BYTE, buf)
+        mask_hi = np.frombuffer(buf, dtype=np.uint8).reshape(Hhi, Whi)
+        mask_hi = np.flipud(mask_hi)
+
+        gl.glViewport(0, 0, self.ctx.width, self.ctx.height)
+        self._restore_render_state(srgb_enabled, blend_enabled, cull_enabled)
+        self.aspect = prev_aspect
+
+        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, 0)
+        gl.glDeleteFramebuffers(1, ctypes.byref(fbo))
+        gl.glDeleteTextures(1, ctypes.byref(color_tex))
+        gl.glDeleteRenderbuffers(1, ctypes.byref(depth_rbo))
+
+        return majority_pool_uint8(mask_hi, factor, prefer_nonzero=True)
+
+    def render_class_id_mask_supersampled(self, class_to_id: Dict[str, int], factor: int = 2) -> np.ndarray:
+        """Render class IDs with supersampling and majority-pool downsampling.
+        
+        Args:
+            class_to_id: Dictionary mapping class names to integer IDs
+            factor: Supersampling factor (2, 3, or 4 recommended). Must result in dimensions
+                   divisible by the factor. If factor=1, falls back to single-sample rendering.
+        
+        Returns:
+            uint8 array of shape (H, W) with class IDs
+        """
+        factor = int(max(1, factor))
+        if factor == 1:
+            return self.render_class_id_mask_msaa_safe(class_to_id)
+        return self._render_integer_ids_supersampled(class_to_id, factor)
 
     # ------------------------------- QC -------------------------------
     def qc_fraction_in_frame(self) -> float:

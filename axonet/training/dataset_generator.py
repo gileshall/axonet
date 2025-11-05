@@ -217,14 +217,14 @@ def render_with_masks(
             depth_path = img_dir / f"{rel_name}_{i:04d}_depth.png"
             imwrite(depth_path, depth_output)
 
-            # Render class id mask in GL for correct depth ordering (MSAA-safe)
-            mask = core.render_class_id_mask_msaa_safe({
+            # Render class id mask with supersampling + majority pooling
+            mask = core.render_class_id_mask_supersampled({
                 NeuronClass.SOMA.name: CLASS_MAP[NeuronClass.SOMA.name],
                 NeuronClass.AXON.name: CLASS_MAP[NeuronClass.AXON.name],
                 NeuronClass.BASAL_DENDRITE.name: CLASS_MAP[NeuronClass.BASAL_DENDRITE.name],
                 NeuronClass.APICAL_DENDRITE.name: CLASS_MAP[NeuronClass.APICAL_DENDRITE.name],
                 NeuronClass.OTHER.name: CLASS_MAP[NeuronClass.OTHER.name],
-            })
+            }, factor=2)
             
             # Debug: check mask values
             if i == 0:
