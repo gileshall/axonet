@@ -68,10 +68,14 @@ class Down(nn.Module):
 
 class Up(nn.Module):
     """Upsampling with bilinear + 1x1 conv, concatenate skip, then ConvBlock."""
-    def __init__(self, in_ch: int, out_ch: int):
+    def __init__(self, in_ch: int, out_ch: int, skip_ch: int | None = None):
         super().__init__()
-        self.proj = nn.Conv2d(in_ch // 2, in_ch // 2, kernel_size=1, bias=False)
-        self.conv = ConvBlock(in_ch, out_ch)
+        # Project input to match skip connection channels, then concatenate
+        # If skip_ch not provided, assume input and skip have same channels (in_ch // 2 each)
+        if skip_ch is None:
+            skip_ch = in_ch // 2
+        self.proj = nn.Conv2d(in_ch, skip_ch, kernel_size=1, bias=False)
+        self.conv = ConvBlock(skip_ch + skip_ch, out_ch)  # concat: skip + projected input
 
     def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
         x = F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
@@ -132,9 +136,12 @@ class SegVAE2D(nn.Module):
         self.post_z = nn.Conv2d(latent_channels, ch4, kernel_size=1)
 
         # Decoder (shared trunk for all heads)
-        self.up3 = Up(ch4 + ch3, ch3)
-        self.up2 = Up(ch3 + ch2, ch2)
-        self.up1 = Up(ch2 + ch1, ch1)
+        # up3: projects ch4 -> ch3, concat with skip2 (ch3) -> ch3+ch3 -> ch3
+        self.up3 = Up(ch4, ch3, skip_ch=ch3)
+        # up2: projects ch3 -> ch2, concat with skip1 (ch2) -> ch2+ch2 -> ch2
+        self.up2 = Up(ch3, ch2, skip_ch=ch2)
+        # up1: projects ch2 -> ch1, concat with skip0 (ch1) -> ch1+ch1 -> ch1
+        self.up1 = Up(ch2, ch1, skip_ch=ch1)
         self.dec_out = ConvBlock(ch1, ch1)
 
         # Heads

@@ -93,6 +93,7 @@ def render_with_masks(
     swc_path: Path,
     out_dir: Path,
     *,
+    root_dir: Path,
     views: int,
     width: int,
     height: int,
@@ -110,6 +111,7 @@ def render_with_masks(
     sampling: str,
     auto_margin: bool,
     seed: int | None,
+    supersample_factor: int = 2,
 ) -> Tuple[Path, List[dict]]:
     """Render image + segmentation mask pairs."""
     from ..io import NeuronClass
@@ -177,11 +179,8 @@ def render_with_masks(
                 auto_margin=auto_margin,
             )
 
-            # Render RGB image and capture depth from same render
-            rgba, depth = core.render_rgba(background=background, also_return_depth=True)
-            out_name = f"{rel_name}_{i:04d}.png"
-            out_path = img_dir / out_name
-            imwrite(out_path, rgba[:, :, :3])
+            # Render depth map (supersampled internally for determinism)
+            depth = core.render_depth(factor=supersample_factor)
             
             # Depth is already in [0,1] range where closer = brighter (no inversion needed)
             depth_visual = depth
@@ -224,8 +223,8 @@ def render_with_masks(
                 NeuronClass.BASAL_DENDRITE.name: CLASS_MAP[NeuronClass.BASAL_DENDRITE.name],
                 NeuronClass.APICAL_DENDRITE.name: CLASS_MAP[NeuronClass.APICAL_DENDRITE.name],
                 NeuronClass.OTHER.name: CLASS_MAP[NeuronClass.OTHER.name],
-            }, factor=2)
-            
+            }, factor=supersample_factor)
+                
             # Debug: check mask values
             if i == 0:
                 unique_vals = np.unique(mask)
@@ -245,12 +244,17 @@ def render_with_masks(
             color_path = img_dir / f"{rel_name}_{i:04d}_mask_color.png"
             imwrite(color_path, colorized)
 
+            # Save binary (black/white) mask: non-background -> white(255), background -> black(0)
+            mask_bw = np.where(mask != 0, 255, 0).astype(np.uint8)
+            mask_bw_path = img_dir / f"{rel_name}_{i:04d}_mask_bw.png"
+            imwrite(mask_bw_path, mask_bw)
+
             entry = {
                 "swc": str(swc_path.name),
-                "image": str(out_path.relative_to(out_dir)),
-                "mask": str(mask_path.relative_to(out_dir)),
-                "depth": str(depth_path.relative_to(out_dir)),
-                "mask_color": str(color_path.relative_to(out_dir)),
+                "mask": str(mask_path.relative_to(root_dir)),
+                "depth": str(depth_path.relative_to(root_dir)),
+                "mask_color": str(color_path.relative_to(root_dir)),
+                "mask_bw": str(mask_bw_path.relative_to(root_dir)),
                 "idx": i,
                 "qc_fraction": float(qc),
                 "projection": "perspective" if core.camera.perspective else "ortho",
@@ -293,6 +297,7 @@ def main():
     p.add_argument("--sampling", choices=["fibonacci", "random"], default="fibonacci")
     p.add_argument("--auto-margin", action="store_true")
     p.add_argument("--seed", type=int, default=1234)
+    p.add_argument("--supersample-factor", type=int, default=2, help="Supersampling factor for depth and mask rendering (2, 3, or 4 recommended)")
     p.add_argument("-j", "--jobs", type=int, default=1, help="Number of parallel jobs (1 = sequential)")
     args = p.parse_args()
 
@@ -325,6 +330,7 @@ def main():
         "seed": args.seed,
         "radius_adaptive_alpha": args.radius_adaptive_alpha,
         "radius_ref_percentile": args.radius_ref_percentile,
+        "supersample_factor": args.supersample_factor,
     }
 
     total = 0
@@ -336,14 +342,13 @@ def main():
         
         # Use imap_unordered for progress updates
         with multiprocessing.Pool(args.jobs) as pool:
-            tasks = [(swc, out_dir / "images", render_args) for swc in swc_files]
+            tasks = [(swc, out_dir / "images", {**render_args, "root_dir": out_dir}) for swc in swc_files]
             completed = 0
             with open(manifest_path, "w", encoding="utf-8") as fout:
                 for swc_path, manifest_entries in pool.imap_unordered(_render_worker, tasks):
                     completed += 1
                     for e in manifest_entries:
                         e["swc"] = str(Path(e["swc"]).as_posix())
-                        e["image"] = str(Path(e["image"]).as_posix())
                         e["mask"] = str(Path(e["mask"]).as_posix())
                         e["depth"] = str(Path(e["depth"]).as_posix())
                         fout.write(json.dumps(e, ensure_ascii=False) + "\n")
@@ -362,11 +367,11 @@ def main():
                 swc_path, manifest_entries = render_with_masks(
                     swc,
                     out_dir / "images",
+                    root_dir=out_dir,
                     **render_args
                 )
                 for e in manifest_entries:
                     e["swc"] = str(Path(e["swc"]).as_posix())
-                    e["image"] = str(Path(e["image"]).as_posix())
                     e["mask"] = str(Path(e["mask"]).as_posix())
                     e["depth"] = str(Path(e["depth"]).as_posix())
                     fout.write(json.dumps(e, ensure_ascii=False) + "\n")
