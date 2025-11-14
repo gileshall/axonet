@@ -3,13 +3,14 @@ Complete dataset generator for SegVAE2D training.
 
 Generates paired images + segmentation masks from SWC neuron data.
 Integrates with render.py for high-quality rendering.
+
+Splits datasets at the SWC (sample) level, not camera pose level.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import math
 import multiprocessing
 import random
 import time
@@ -116,7 +117,6 @@ def render_with_masks(
     """Render image + segmentation mask pairs."""
     from ..io import NeuronClass
     
-    # Formal class name -> value mapping used for all outputs
     CLASS_MAP = {
         "BACKGROUND": 0,
         NeuronClass.SOMA.name: 1,
@@ -179,13 +179,10 @@ def render_with_masks(
                 auto_margin=auto_margin,
             )
 
-            # Render depth map (supersampled internally for determinism)
             depth = core.render_depth(factor=supersample_factor)
             
-            # Depth is already in [0,1] range where closer = brighter (no inversion needed)
             depth_visual = depth
             
-            # Find valid pixels (exclude background at far plane)
             valid_mask = depth < 0.999
             
             if valid_mask.any():
@@ -193,7 +190,6 @@ def render_with_masks(
                 if len(valid_depths) > 0:
                     dmin, dmax = valid_depths.min(), valid_depths.max()
                     
-                    # Remap depth to full 0-255 range: near objects become white, far objects become darker gray
                     if dmax > dmin:
                         depth_normalized = np.where(
                             valid_mask,
@@ -202,21 +198,18 @@ def render_with_masks(
                         )
                         depth_output = np.clip(depth_normalized, 0, 255).astype(np.uint8)
                     else:
-                        # All at same depth, just set to medium gray
                         depth_output = np.where(valid_mask, 128, 0).astype(np.uint8)
                 else:
                     depth_output = np.zeros_like(depth_visual, dtype=np.uint8)
             else:
                 depth_output = np.zeros_like(depth_visual, dtype=np.uint8)
             
-            # Debug output
             if i == 0:
                 valid_pixels = np.sum(valid_mask)
                 print(f"  Depth stats: valid={valid_pixels}/{depth.size}, raw_min={depth.min():.3f}, raw_max={depth.max():.3f}")
             depth_path = img_dir / f"{rel_name}_{i:04d}_depth.png"
             imwrite(depth_path, depth_output)
 
-            # Render class id mask with supersampling + majority pooling
             mask = core.render_class_id_mask_supersampled({
                 NeuronClass.SOMA.name: CLASS_MAP[NeuronClass.SOMA.name],
                 NeuronClass.AXON.name: CLASS_MAP[NeuronClass.AXON.name],
@@ -225,7 +218,6 @@ def render_with_masks(
                 NeuronClass.OTHER.name: CLASS_MAP[NeuronClass.OTHER.name],
             }, factor=supersample_factor)
                 
-            # Debug: check mask values
             if i == 0:
                 unique_vals = np.unique(mask)
                 print(f"  Mask debug: unique values={unique_vals}, shape={mask.shape}, dtype={mask.dtype}")
@@ -234,7 +226,6 @@ def render_with_masks(
             mask_path = img_dir / f"{rel_name}_{i:04d}_mask.png"
             imwrite(mask_path, mask)
 
-            # Save colorized segmentation receipt image for auditing
             colorized = np.zeros((height, width, 3), dtype=np.uint8)
             for cls_name, cls_val in CLASS_MAP.items():
                 if cls_name == "BACKGROUND":
@@ -244,7 +235,6 @@ def render_with_masks(
             color_path = img_dir / f"{rel_name}_{i:04d}_mask_color.png"
             imwrite(color_path, colorized)
 
-            # Save binary (black/white) mask: non-background -> white(255), background -> black(0)
             mask_bw = np.where(mask != 0, 255, 0).astype(np.uint8)
             mask_bw_path = img_dir / f"{rel_name}_{i:04d}_mask_bw.png"
             imwrite(mask_bw_path, mask_bw)
@@ -276,6 +266,24 @@ def render_with_masks(
     return (swc_path, manifest_entries)
 
 
+def split_swc_files(swc_files: List[Path], val_ratio: float, test_ratio: float, seed: int) -> Tuple[List[Path], List[Path], List[Path]]:
+    """Split SWC files into train/val/test sets at the sample level."""
+    rng = random.Random(seed)
+    shuffled = swc_files.copy()
+    rng.shuffle(shuffled)
+    
+    total = len(shuffled)
+    test_size = int(test_ratio * total) if test_ratio > 0 else 0
+    val_size = int(val_ratio * total) if val_ratio > 0 else 0
+    train_size = total - val_size - test_size
+    
+    test_files = shuffled[:test_size] if test_size > 0 else []
+    val_files = shuffled[test_size:test_size + val_size] if val_size > 0 else []
+    train_files = shuffled[test_size + val_size:] if train_size > 0 else []
+    
+    return train_files, val_files, test_files
+
+
 def main():
     p = argparse.ArgumentParser(description="Generate dataset for SegVAE2D training")
     p.add_argument("--swc-dir", type=Path, required=True, help="Directory containing .swc files")
@@ -299,7 +307,19 @@ def main():
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--supersample-factor", type=int, default=2, help="Supersampling factor for depth and mask rendering (2, 3, or 4 recommended)")
     p.add_argument("-j", "--jobs", type=int, default=1, help="Number of parallel jobs (1 = sequential)")
+    
+    p.add_argument("--val-ratio", type=float, default=0.0, help="Validation set ratio (0.0 = no validation set, default: 0.0)")
+    p.add_argument("--test-ratio", type=float, default=0.0, help="Test set ratio (0.0 = no test set, default: 0.0)")
+    p.add_argument("--split-seed", type=int, default=42, help="Random seed for SWC file splitting")
+    
     args = p.parse_args()
+
+    if args.val_ratio < 0 or args.val_ratio >= 1:
+        raise ValueError("--val-ratio must be in [0, 1)")
+    if args.test_ratio < 0 or args.test_ratio >= 1:
+        raise ValueError("--test-ratio must be in [0, 1)")
+    if args.val_ratio + args.test_ratio >= 1:
+        raise ValueError("--val-ratio + --test-ratio must be < 1")
 
     out_dir = args.out
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -309,8 +329,10 @@ def main():
     if not swc_files:
         raise SystemExit(f"No .swc files found under {args.swc_dir}")
 
-    manifest_path = out_dir / "manifest.jsonl"
-    print(f"Found {len(swc_files)} SWC files. Writing to {manifest_path}")
+    train_files, val_files, test_files = split_swc_files(swc_files, args.val_ratio, args.test_ratio, args.split_seed)
+    
+    print(f"Found {len(swc_files)} SWC files")
+    print(f"Split: train={len(train_files)}, val={len(val_files)}, test={len(test_files)}")
     
     render_args = {
         "views": args.views,
@@ -333,53 +355,71 @@ def main():
         "supersample_factor": args.supersample_factor,
     }
 
-    total = 0
-    start_time = time.time()
-    
-    if args.jobs > 1:
-        print(f"\nRendering {len(swc_files)} SWC files with {args.jobs} parallel workers...")
-        print(f"Expected ~{len(swc_files) * args.views} total samples\n")
+    def process_split(split_name: str, swc_list: List[Path], manifest_path: Path):
+        """Process a single split (train/val/test)."""
+        if not swc_list:
+            return 0
         
-        # Use imap_unordered for progress updates
-        with multiprocessing.Pool(args.jobs) as pool:
-            tasks = [(swc, out_dir / "images", {**render_args, "root_dir": out_dir}) for swc in swc_files]
-            completed = 0
+        print(f"\nProcessing {split_name} set ({len(swc_list)} SWC files)...")
+        total = 0
+        start_time = time.time()
+        
+        if args.jobs > 1:
+            print(f"Rendering with {args.jobs} parallel workers...")
+            print(f"Expected ~{len(swc_list) * args.views} total samples\n")
+            
+            with multiprocessing.Pool(args.jobs) as pool:
+                tasks = [(swc, out_dir / "images", {**render_args, "root_dir": out_dir}) for swc in swc_list]
+                completed = 0
+                with open(manifest_path, "w", encoding="utf-8") as fout:
+                    for swc_path, manifest_entries in pool.imap_unordered(_render_worker, tasks):
+                        completed += 1
+                        for e in manifest_entries:
+                            e["swc"] = str(Path(e["swc"]).as_posix())
+                            e["mask"] = str(Path(e["mask"]).as_posix())
+                            e["depth"] = str(Path(e["depth"]).as_posix())
+                            fout.write(json.dumps(e, ensure_ascii=False) + "\n")
+                            total += 1
+                        _print_progress(completed, len(swc_list), start_time, 
+                                      f"  {swc_path.name} ({len(manifest_entries)} views): ")
+        else:
+            print(f"Rendering sequentially...")
+            print(f"Expected ~{len(swc_list) * args.views} total samples\n")
+            
             with open(manifest_path, "w", encoding="utf-8") as fout:
-                for swc_path, manifest_entries in pool.imap_unordered(_render_worker, tasks):
-                    completed += 1
+                for idx, swc in enumerate(swc_list):
+                    _print_progress(idx, len(swc_list), start_time, 
+                                  f"Rendering {swc.name}: ")
+                    
+                    swc_path, manifest_entries = render_with_masks(
+                        swc,
+                        out_dir / "images",
+                        root_dir=out_dir,
+                        **render_args
+                    )
                     for e in manifest_entries:
                         e["swc"] = str(Path(e["swc"]).as_posix())
                         e["mask"] = str(Path(e["mask"]).as_posix())
                         e["depth"] = str(Path(e["depth"]).as_posix())
                         fout.write(json.dumps(e, ensure_ascii=False) + "\n")
                         total += 1
-                    _print_progress(completed, len(swc_files), start_time, 
-                                  f"  {swc_path.name} ({len(manifest_entries)} views): ")
-    else:
-        print(f"\nRendering {len(swc_files)} SWC files sequentially...")
-        print(f"Expected ~{len(swc_files) * args.views} total samples\n")
         
-        with open(manifest_path, "w", encoding="utf-8") as fout:
-            for idx, swc in enumerate(swc_files):
-                _print_progress(idx, len(swc_files), start_time, 
-                              f"Rendering {swc.name}: ")
-                
-                swc_path, manifest_entries = render_with_masks(
-                    swc,
-                    out_dir / "images",
-                    root_dir=out_dir,
-                    **render_args
-                )
-                for e in manifest_entries:
-                    e["swc"] = str(Path(e["swc"]).as_posix())
-                    e["mask"] = str(Path(e["mask"]).as_posix())
-                    e["depth"] = str(Path(e["depth"]).as_posix())
-                    fout.write(json.dumps(e, ensure_ascii=False) + "\n")
-                    total += 1
+        elapsed = time.time() - start_time
+        print(f"\n✓ {split_name.capitalize()} set: Generated {total} samples from {len(swc_list)} neurons in {elapsed:.1f}s")
+        return total
 
-    elapsed = time.time() - start_time
-    print(f"\n✓ Done! Generated {total} samples across {len(swc_files)} neurons in {elapsed:.1f}s")
-    print(f"  Average: {total / len(swc_files):.1f} samples per neuron")
+    train_total = process_split("train", train_files, out_dir / "manifest_train.jsonl")
+    val_total = process_split("val", val_files, out_dir / "manifest_val.jsonl") if val_files else 0
+    test_total = process_split("test", test_files, out_dir / "manifest_test.jsonl") if test_files else 0
+
+    print(f"\n{'='*60}")
+    print(f"✓ Complete! Generated {train_total + val_total + test_total} total samples")
+    print(f"  Train: {train_total} samples from {len(train_files)} neurons")
+    if val_files:
+        print(f"  Val:   {val_total} samples from {len(val_files)} neurons")
+    if test_files:
+        print(f"  Test:  {test_total} samples from {len(test_files)} neurons")
+    print(f"{'='*60}")
 
 
 if __name__ == "__main__":

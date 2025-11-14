@@ -108,6 +108,75 @@ def _save_cache(cache_path: Path, input_img: np.ndarray, seg_mask: np.ndarray, c
         logger.warning(f"Failed to save cache to {cache_path}: {e}")
 
 
+def _get_embedding_cache_key(batch_paths: List[Path], checkpoint_path: Optional[Path], reduce: str) -> str:
+    """Generate cache key for embedding batch.
+    
+    Args:
+        batch_paths: Sorted list of SWC file paths in the batch
+        checkpoint_path: Path to model checkpoint (for model versioning)
+        reduce: Embedding reduction method
+    
+    Returns:
+        Cache key string
+    """
+    sorted_paths = sorted([str(p) for p in batch_paths])
+    key_parts = [
+        "|".join(sorted_paths),
+        str(checkpoint_path) if checkpoint_path else "no_checkpoint",
+        reduce,
+    ]
+    key_str = "|".join(key_parts)
+    return hashlib.md5(key_str.encode()).hexdigest()
+
+
+def _get_embedding_cache_path(embedding_cache_dir: Path, cache_key: str) -> Path:
+    """Get cache file path for embeddings.
+    
+    Args:
+        embedding_cache_dir: Embedding cache directory
+        cache_key: Cache key
+    
+    Returns:
+        Path to cache file
+    """
+    embedding_cache_dir.mkdir(parents=True, exist_ok=True)
+    return embedding_cache_dir / f"{cache_key}.pkl"
+
+
+def _load_embedding_cache(cache_path: Path) -> Optional[Dict[str, np.ndarray]]:
+    """Load embeddings from cache.
+    
+    Args:
+        cache_path: Path to cache file
+    
+    Returns:
+        Dict with 'raw' and 'reduced' embeddings or None if not found
+    """
+    if cache_path.exists():
+        try:
+            with open(cache_path, 'rb') as f:
+                return pickle.load(f)
+        except Exception as e:
+            logger.warning(f"Failed to load embedding cache from {cache_path}: {e}")
+            return None
+    return None
+
+
+def _save_embedding_cache(cache_path: Path, embeddings_raw: Dict[str, np.ndarray], embeddings_reduced: Dict[str, np.ndarray]) -> None:
+    """Save embeddings to cache.
+    
+    Args:
+        cache_path: Path to cache file
+        embeddings_raw: Raw embeddings dict (z, mu, logvar)
+        embeddings_reduced: Reduced embeddings dict (z, mu, logvar)
+    """
+    try:
+        with open(cache_path, 'wb') as f:
+            pickle.dump({"raw": embeddings_raw, "reduced": embeddings_reduced}, f)
+    except Exception as e:
+        logger.warning(f"Failed to save embedding cache to {cache_path}: {e}")
+
+
 def _worker_render(args: Tuple[Path, int, int, Dict, Optional[Path]]) -> Tuple[Path, Optional[Tuple[np.ndarray, np.ndarray, Dict]], bool]:
     """Worker function for multiprocessing rendering.
     
@@ -296,6 +365,8 @@ def evaluate_batch(
     class_colors: Optional[Dict[int, np.ndarray]] = None,
     cache_dir: Optional[Path] = None,
     num_workers: Optional[int] = None,
+    checkpoint_path: Optional[Path] = None,
+    embedding_reduce: str = "mean",
 ) -> List[Dict]:
     """Evaluate a batch of SWC files and extract embeddings.
     
@@ -311,6 +382,8 @@ def evaluate_batch(
         class_colors: Dict mapping class ID to RGB color [0-255]
         cache_dir: Directory for caching rendered outputs (optional)
         num_workers: Number of worker processes for rendering (default: half of CPU count)
+        checkpoint_path: Path to model checkpoint (for embedding cache key)
+        embedding_reduce: Embedding reduction method (for embedding cache key)
     
     Returns:
         List of annotation dicts, one per SWC file
@@ -324,6 +397,11 @@ def evaluate_batch(
     if cache_dir is not None:
         logger.info(f"Using cache directory: {cache_dir}")
         cache_dir.mkdir(parents=True, exist_ok=True)
+        embedding_cache_dir = cache_dir / "embedding_cache"
+        embedding_cache_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Using embedding cache directory: {embedding_cache_dir}")
+    else:
+        embedding_cache_dir = None
     
     if class_colors is None:
         class_colors = {
@@ -404,17 +482,41 @@ def evaluate_batch(
             logger.warning(f"    Batch {batch_idx + 1} produced no valid inputs, skipping")
             continue
         
-        logger.info(f"    Extracting embeddings from {len(batch_inputs)} samples...")
-        input_tensor = torch.from_numpy(np.stack(batch_inputs)).unsqueeze(1).float()
-        logger.debug(f"    Stacked input tensor shape: {input_tensor.shape}")
-        
-        embeddings_raw = extract_embeddings(model, input_tensor, device, reduce="none")
-        logger.debug(f"    Raw embeddings: z={embeddings_raw['z'].shape}, mu={embeddings_raw['mu'].shape}")
-        
-        embeddings_reduced = extract_embeddings(model, input_tensor, device, reduce="mean")
-        logger.debug(f"    Reduced embeddings: z={embeddings_reduced['z'].shape}, mu={embeddings_reduced['mu'].shape}")
-        
         successful_batch_paths = [p for p in batch_paths if p not in batch_failed]
+        
+        embeddings_raw = None
+        embeddings_reduced = None
+        from_embedding_cache = False
+        
+        if embedding_cache_dir is not None:
+            embedding_cache_key = _get_embedding_cache_key(successful_batch_paths, checkpoint_path, embedding_reduce)
+            embedding_cache_path = _get_embedding_cache_path(embedding_cache_dir, embedding_cache_key)
+            
+            cached_embeddings = _load_embedding_cache(embedding_cache_path)
+            if cached_embeddings is not None:
+                logger.info(f"    Loading embeddings from cache...")
+                embeddings_raw = cached_embeddings["raw"]
+                embeddings_reduced = cached_embeddings["reduced"]
+                from_embedding_cache = True
+                logger.debug(f"    Cached embeddings: raw z={embeddings_raw['z'].shape}, reduced z={embeddings_reduced['z'].shape}")
+        
+        if embeddings_raw is None or embeddings_reduced is None:
+            logger.info(f"    Extracting embeddings from {len(batch_inputs)} samples...")
+            input_tensor = torch.from_numpy(np.stack(batch_inputs)).unsqueeze(1).float()
+            logger.debug(f"    Stacked input tensor shape: {input_tensor.shape}")
+            
+            embeddings_raw = extract_embeddings(model, input_tensor, device, reduce="none")
+            logger.debug(f"    Raw embeddings: z={embeddings_raw['z'].shape}, mu={embeddings_raw['mu'].shape}")
+            
+            embeddings_reduced = extract_embeddings(model, input_tensor, device, reduce=embedding_reduce)
+            logger.debug(f"    Reduced embeddings: z={embeddings_reduced['z'].shape}, mu={embeddings_reduced['mu'].shape}")
+            
+            if embedding_cache_dir is not None:
+                logger.info(f"    Saving embeddings to cache...")
+                _save_embedding_cache(embedding_cache_path, embeddings_raw, embeddings_reduced)
+        
+        if from_embedding_cache:
+            logger.info(f"    Embeddings loaded from cache")
         
         for i, swc_path in enumerate(successful_batch_paths):
             if i >= len(batch_inputs):
@@ -849,6 +951,8 @@ def main():
             output_dir=args.output,
             cache_dir=cache_dir,
             num_workers=args.num_workers,
+            checkpoint_path=args.checkpoint,
+            embedding_reduce=args.embedding_reduce,
         )
         
         if not annotations:
@@ -859,65 +963,9 @@ def main():
         n_total = len(successful_swc_paths)
         logger.info(f"Successfully processed {n_total} files for projector dataset")
         
-        logger.info(f"Extracting reduced embeddings from {n_total} files (reduce={args.embedding_reduce})...")
-        render_kwargs = {
-            "segments": 18,
-            "radius_scale": 1.0,
-            "radius_adaptive_alpha": 0.0,
-            "radius_ref_percentile": 50.0,
-            "projection": "ortho",
-            "fovy": 55.0,
-            "margin": 0.85,
-            "supersample_factor": 2,
-        }
-        
-        num_workers = args.num_workers if args.num_workers else max(1, multiprocessing.cpu_count() // 2)
-        render_tasks = [(swc_path, args.width, args.height, render_kwargs, cache_dir) for swc_path in successful_swc_paths]
-        
-        logger.info(f"  Rendering inputs with multiprocessing (workers={num_workers})...")
-        with multiprocessing.Pool(processes=num_workers) as pool:
-            results = pool.map(_worker_render, render_tasks)
-        
-        all_inputs = []
-        cached_count = 0
-        rendered_count = 0
-        for swc_path, result, from_cache in results:
-            if result is None:
-                logger.warning(f"  Failed to render {swc_path.name}")
-                continue
-            all_inputs.append(result[0])
-            if from_cache:
-                cached_count += 1
-            else:
-                rendered_count += 1
-        
-        logger.info(f"  Rendering complete: {cached_count} from cache, {rendered_count} newly rendered")
-        
-        logger.info(f"  Computing embeddings from {len(all_inputs)} inputs...")
-        input_tensor = torch.from_numpy(np.stack(all_inputs)).unsqueeze(1).float()
-        logger.debug(f"  Input tensor shape: {input_tensor.shape}")
-        
-        logger.info(f"  Extracting raw embeddings (no reduction)...")
-        embeddings_raw_dict = extract_embeddings(model, input_tensor, device, reduce="none")
-        logger.debug(f"  Raw embeddings shape: z={embeddings_raw_dict['z'].shape}, mu={embeddings_raw_dict['mu'].shape}")
-        
-        logger.info(f"  Extracting reduced embeddings (reduce={args.embedding_reduce})...")
-        embeddings_reduced_dict = extract_embeddings(model, input_tensor, device, reduce=args.embedding_reduce)
-        logger.debug(f"  Reduced embeddings shape: z={embeddings_reduced_dict['z'].shape}, mu={embeddings_reduced_dict['mu'].shape}")
-        
-        embeddings_reduced = embeddings_reduced_dict["mu"]
+        logger.info(f"Extracting embeddings from annotations (reduce={args.embedding_reduce})...")
+        embeddings_reduced = np.array([ann["embedding_mu"] for ann in annotations])
         logger.info(f"  Extracted embeddings shape: {embeddings_reduced.shape}")
-        
-        logger.debug("Updating annotations with raw and reduced embeddings...")
-        for i, ann in enumerate(annotations):
-            ann["embedding_z_raw"] = embeddings_raw_dict["z"][i].tolist()
-            ann["embedding_mu_raw"] = embeddings_raw_dict["mu"][i].tolist()
-            ann["embedding_logvar_raw"] = embeddings_raw_dict["logvar"][i].tolist()
-            ann["embedding_dim_raw"] = list(embeddings_raw_dict["z"][i].shape)
-            ann["embedding_mu"] = embeddings_reduced[i].tolist()
-            ann["embedding_z"] = embeddings_reduced_dict["z"][i].tolist()
-            ann["embedding_logvar"] = embeddings_reduced_dict["logvar"][i].tolist()
-            ann["embedding_dim"] = int(embeddings_reduced.shape[1])
         
         logger.info(f"Rendering {n_total} thumbnails (size: {args.thumbnail_size}x{args.thumbnail_size})...")
         thumbnails = []
@@ -983,6 +1031,8 @@ def main():
             output_dir=args.output,
             cache_dir=cache_dir,
             num_workers=args.num_workers,
+            checkpoint_path=args.checkpoint,
+            embedding_reduce=args.embedding_reduce,
         )
         
         logger.info("Writing annotations JSON...")

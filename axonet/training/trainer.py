@@ -1,26 +1,21 @@
-"""Training script for SegVAE2D model."""
+"""Training script for SegVAE2D model using PyTorch Lightning."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import random
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
-from torch.utils.tensorboard import SummaryWriter
 from imageio.v2 import imread
-
-try:
-    import wandb
-    WANDB_AVAILABLE = True
-except ImportError:
-    WANDB_AVAILABLE = False
-    wandb = None
+from pytorch_lightning import LightningDataModule, LightningModule, Trainer
+from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
+from pytorch_lightning.loggers import TensorBoardLogger, WandbLogger
+from torch.utils.data import DataLoader, Dataset
 
 from ..models.d3_swc_vae import SegVAE2D, MultiTaskLoss, build_model
 
@@ -39,6 +34,11 @@ class NeuronDataset(Dataset):
         transform=None,
         load_depth: bool = False,
         load_recon: bool = False,
+        use_inpaint: bool = False,
+        inpaint_mask_type: str = "rect",
+        inpaint_mask_ratio: float = 0.25,
+        inpaint_min_size: float = 0.1,
+        inpaint_max_size: float = 0.3,
     ):
         self.data_root = Path(data_root)
         self.manifest_entries = []
@@ -47,13 +47,17 @@ class NeuronDataset(Dataset):
                 entry = json.loads(line.strip())
                 self.manifest_entries.append(entry)
         
-        # Auto-detect depth availability
         if not load_depth and len(self.manifest_entries) > 0 and "depth" in self.manifest_entries[0]:
             load_depth = True
         
         self.transform = transform
         self.load_depth = load_depth
         self.load_recon = load_recon
+        self.use_inpaint = use_inpaint and load_recon
+        self.inpaint_mask_type = inpaint_mask_type
+        self.inpaint_mask_ratio = inpaint_mask_ratio
+        self.inpaint_min_size = inpaint_min_size
+        self.inpaint_max_size = inpaint_max_size
 
     def __len__(self):
         return len(self.manifest_entries)
@@ -61,31 +65,24 @@ class NeuronDataset(Dataset):
     def __getitem__(self, idx):
         entry = self.manifest_entries[idx]
         
-        # Load input: use mask_bw (binary black/white mask) as input image
-        # Handle paths that may or may not include 'images/' prefix
         if "mask_bw" in entry:
             input_path = self._resolve_path(entry["mask_bw"])
         elif "image" in entry:
-            # Fallback to image if mask_bw not available (backward compatibility)
             input_path = self._resolve_path(entry["image"])
         else:
             raise ValueError(f"Manifest entry missing both 'mask_bw' and 'image' fields: {entry}")
         
         mask_path = self._resolve_path(entry["mask"])
         
-        # Load input (mask_bw is already grayscale uint8: 0=black, 255=white)
         input_img = imread(input_path)
         if len(input_img.shape) == 3:
-            # RGB to grayscale (fallback case)
             input_img = np.mean(input_img, axis=2, dtype=np.float32) / 255.0
         else:
             input_img = input_img.astype(np.float32) / 255.0
         
-        # Load segmentation mask
         mask = imread(mask_path)
         
-        # Convert to tensors
-        input_tensor = torch.from_numpy(input_img).unsqueeze(0)  # Add channel dim
+        input_tensor = torch.from_numpy(input_img).unsqueeze(0)
         mask_tensor = torch.from_numpy(mask).long()
         
         sample = {
@@ -101,32 +98,68 @@ class NeuronDataset(Dataset):
         
         if self.load_recon:
             sample["recon"] = input_tensor.clone()
+            
+            if self.use_inpaint:
+                inpaint_mask = self._generate_inpaint_mask(input_tensor.shape[-2:])
+                sample["inpaint_mask"] = inpaint_mask
         
         if self.transform:
             sample = self.transform(sample)
         
         return sample
+    
+    def _generate_inpaint_mask(self, img_shape: tuple) -> torch.Tensor:
+        """Generate inpainting mask for reconstruction task.
+        
+        Returns mask where 1.0 = masked region (loss computed here), 0.0 = visible region (loss ignored).
+        """
+        h, w = img_shape
+        mask = torch.zeros(1, h, w, dtype=torch.float32)
+        
+        if self.inpaint_mask_type == "rect":
+            num_patches = random.randint(1, 3)
+            for _ in range(num_patches):
+                patch_h = int(h * random.uniform(self.inpaint_min_size, self.inpaint_max_size))
+                patch_w = int(w * random.uniform(self.inpaint_min_size, self.inpaint_max_size))
+                y = random.randint(0, max(1, h - patch_h))
+                x = random.randint(0, max(1, w - patch_w))
+                mask[:, y:y+patch_h, x:x+patch_w] = 1.0
+        elif self.inpaint_mask_type == "random":
+            num_pixels = int(h * w * self.inpaint_mask_ratio)
+            flat_mask = mask.flatten()
+            indices = torch.randperm(len(flat_mask))[:num_pixels]
+            flat_mask[indices] = 1.0
+            mask = flat_mask.reshape(1, h, w)
+        elif self.inpaint_mask_type == "center":
+            center_h, center_w = h // 2, w // 2
+            patch_h = int(h * random.uniform(self.inpaint_min_size, self.inpaint_max_size))
+            patch_w = int(w * random.uniform(self.inpaint_min_size, self.inpaint_max_size))
+            y = center_h - patch_h // 2
+            x = center_w - patch_w // 2
+            y = max(0, min(y, h - patch_h))
+            x = max(0, min(x, w - patch_w))
+            mask[:, y:y+patch_h, x:x+patch_w] = 1.0
+        else:
+            raise ValueError(f"Unknown mask type: {self.inpaint_mask_type}")
+        
+        return mask
 
     def _resolve_path(self, rel_path: str) -> Path:
         """Resolve a relative path from manifest, handling both with and without 'images/' prefix."""
-        # Try as-is first
         path = self.data_root / rel_path
         if path.exists():
             return path
         
-        # If path doesn't start with 'images/', try adding it
         if not rel_path.startswith("images/"):
             path = self.data_root / "images" / rel_path
             if path.exists():
                 return path
         
-        # If path starts with 'images/', try without it
         if rel_path.startswith("images/"):
-            path = self.data_root / rel_path[7:]  # Remove "images/" prefix
+            path = self.data_root / rel_path[7:]
             if path.exists():
                 return path
         
-        # If still not found, return the original path (will raise FileNotFoundError)
         return self.data_root / rel_path
 
     def _load_depth(self, entry: Dict):
@@ -155,333 +188,264 @@ def collate_fn(batch):
             batched["depth"] = torch.stack([item["depth"] for item in batch])
         elif key == "valid_depth_mask":
             batched["valid_depth_mask"] = torch.stack([item["valid_depth_mask"] for item in batch])
+        elif key == "inpaint_mask":
+            batched["inpaint_mask"] = torch.stack([item["inpaint_mask"] for item in batch])
     
     return batched
 
 
-class Trainer:
-    """Main trainer class for SegVAE2D."""
+class SegVAE2DLightning(LightningModule):
+    """PyTorch Lightning module for SegVAE2D training."""
 
     def __init__(
         self,
-        model: SegVAE2D,
-        train_loader: DataLoader,
-        val_loader: DataLoader,
-        criterion: MultiTaskLoss,
-        optimizer: optim.Optimizer,
-        lr_scheduler: optim.lr_scheduler._LRScheduler | None = None,
-        *,
-        test_loader: DataLoader | None = None,
-        device: str | None = None,
-        save_dir: Path | None = None,
-        log_dir: Path | None = None,
-        checkpoint_step: int = 100,
-        test_step: int = 100,
-        max_test_samples: int = 50,
+        in_channels: int = 1,
+        base_channels: int = 64,
+        num_classes: int = 4,
+        latent_channels: int = 128,
+        skip_latent_mult: float = 0.5,
+        use_depth: bool = False,
+        use_recon: bool = False,
+        kld_weight: float = 0.1,
+        skip_mode: str = "variational",
+        free_nats: float = 0.0,
+        beta: float = 1.0,
+        lambda_seg: float = 1.0,
+        lambda_depth: float = 1.0,
+        lambda_recon: float = 1.0,
+        lr: float = 1e-4,
+        weight_decay: float = 1e-5,
+        lr_scheduler: str = "cosine",
+        lr_t_max: int = 10000,
+        lr_eta_min: float = 1e-6,
     ):
-        # Auto-detect device if not provided
-        if device is None:
-            if torch.backends.mps.is_available():
-                device = "mps"
-            elif torch.cuda.is_available():
-                device = "cuda"
-            else:
-                device = "cpu"
-        self.model = model.to(device)
-        self.train_loader = train_loader
-        self.val_loader = val_loader
-        self.test_loader = test_loader
-        self.criterion = criterion
-        self.optimizer = optimizer
+        super().__init__()
+        self.save_hyperparameters()
+        
+        self.model = build_model(
+            in_channels=in_channels,
+            base_channels=base_channels,
+            num_classes=num_classes,
+            latent_channels=latent_channels,
+            skip_latent_mult=skip_latent_mult,
+            use_depth=use_depth,
+            use_recon=use_recon,
+            kld_weight=kld_weight,
+            skip_mode=skip_mode,
+            free_nats=free_nats,
+            beta=beta,
+        )
+        
+        self.criterion = MultiTaskLoss(
+            lambda_seg=lambda_seg,
+            lambda_depth=lambda_depth,
+            lambda_recon=lambda_recon,
+        )
+        
+        self.lr = lr
+        self.weight_decay = weight_decay
         self.lr_scheduler = lr_scheduler
-        self.device = device
-        self.save_dir = Path(save_dir) if save_dir else None
-        self.log_dir = Path(log_dir) if log_dir else None
-        self.checkpoint_step = checkpoint_step
-        self.test_step = test_step
-        self.max_test_samples = max_test_samples
+        self.lr_t_max = lr_t_max
+        self.lr_eta_min = lr_eta_min
+
+    def forward(self, x):
+        return self.model(x)
+
+    def training_step(self, batch, batch_idx):
+        outputs = self.model(batch["input"])
+        loss, logs = self.criterion(outputs, batch)
         
-        if self.log_dir:
-            self.writer = SummaryWriter(str(self.log_dir))
+        self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True)
+        for key, value in logs.items():
+            self.log(f"train/{key}", value, on_step=True, on_epoch=True)
+        
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        outputs = self.model(batch["input"])
+        loss, logs = self.criterion(outputs, batch)
+        
+        self.log("val/loss", loss, on_step=False, on_epoch=True, prog_bar=True)
+        for key, value in logs.items():
+            self.log(f"val/{key}", value, on_step=False, on_epoch=True)
+        
+        return loss
+
+    def test_step(self, batch, batch_idx):
+        outputs = self.model(batch["input"])
+        loss, logs = self.criterion(outputs, batch)
+        
+        self.log("test/loss", loss, on_step=False, on_epoch=True)
+        for key, value in logs.items():
+            self.log(f"test/{key}", value, on_step=False, on_epoch=True)
+        
+        return loss
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.AdamW(
+            self.parameters(),
+            lr=self.lr,
+            weight_decay=self.weight_decay,
+        )
+        
+        if self.lr_scheduler == "cosine":
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=self.lr_t_max,
+                eta_min=self.lr_eta_min,
+            )
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "interval": "step",
+                },
+            }
+        elif self.lr_scheduler == "plateau":
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode="min",
+                factor=0.5,
+                patience=10,
+            )
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "monitor": "val/loss",
+                    "interval": "epoch",
+                },
+            }
+        elif self.lr_scheduler == "step":
+            scheduler = torch.optim.lr_scheduler.StepLR(
+                optimizer,
+                step_size=5000,
+                gamma=0.5,
+            )
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "interval": "step",
+                },
+            }
         else:
-            self.writer = None
-        
-        self.use_wandb = False
-        self.wandb_config = None
-        
-        self.global_step = 0
-        self.start_epoch = 1
-        self.best_val_loss = float("inf")
-        self.first_test_done = False
-    
-    def init_wandb(self, project: str, name: str | None = None, config: dict | None = None):
-        """Initialize Weights & Biases logging."""
-        if not WANDB_AVAILABLE:
-            raise RuntimeError("wandb is not installed. Install it with: pip install wandb")
-        self.use_wandb = True
-        self.wandb_config = config or {}
-        wandb.init(project=project, name=name, config=self.wandb_config)
+            return optimizer
 
-    def train_epoch(self, epoch: int):
-        """Train for one epoch."""
-        self.model.train()
-        train_loss = 0.0
-        num_batches = 0
-        
-        for batch_idx, batch in enumerate(self.train_loader):
-            batch = {k: v.to(self.device) for k, v in batch.items()}
-            
-            self.optimizer.zero_grad()
-            
-            outputs = self.model(batch["input"])
-            
-            loss, logs = self.criterion(outputs, batch)
-            
-            loss.backward()
-            self.optimizer.step()
-            
-            # Step-based LR scheduler (if applicable)
-            if self.lr_scheduler is not None and hasattr(self.lr_scheduler, 'step') and not isinstance(self.lr_scheduler, optim.lr_scheduler.ReduceLROnPlateau):
-                self.lr_scheduler.step()
-            
-            train_loss += loss.item()
-            num_batches += 1
-            
-            if self.writer:
-                for key, value in logs.items():
-                    self.writer.add_scalar(f"train/{key}", value, self.global_step)
-                self.writer.add_scalar("train/loss", loss.item(), self.global_step)
-            
-            if self.use_wandb:
-                wandb_log = {f"train/{key}": value for key, value in logs.items()}
-                wandb_log["train/loss"] = loss.item()
-                wandb_log["train/learning_rate"] = self.optimizer.param_groups[0]["lr"]
-                wandb.log(wandb_log, step=self.global_step)
-            
-            self.global_step += 1
-            
-            # Step-based checkpointing
-            if self.save_dir and self.global_step % self.checkpoint_step == 0:
-                self.save_checkpoint(epoch, is_best=False, step=self.global_step)
-            
-            # Step-based test evaluation
-            if self.test_loader is not None and self.global_step % self.test_step == 0:
-                self.evaluate_test(epoch, save_outputs=not self.first_test_done)
-                self.first_test_done = True
-            
-            if batch_idx % 10 == 0:
-                print(f"Epoch {epoch}, Batch {batch_idx}/{len(self.train_loader)}, Loss: {loss.item():.4f}")
-        
-        avg_loss = train_loss / num_batches if num_batches > 0 else 0.0
-        return avg_loss
 
-    @torch.no_grad()
-    def validate(self, epoch: int):
-        """Validate on validation set."""
-        self.model.eval()
-        val_loss = 0.0
-        num_batches = 0
-        
-        for batch in self.val_loader:
-            batch = {k: v.to(self.device) for k, v in batch.items()}
-            
-            outputs = self.model(batch["input"])
-            
-            loss, logs = self.criterion(outputs, batch)
-            
-            val_loss += loss.item()
-            num_batches += 1
-            
-            if self.writer:
-                for key, value in logs.items():
-                    self.writer.add_scalar(f"val/{key}", value, self.global_step)
-                self.writer.add_scalar("val/loss", loss.item(), self.global_step)
-            
-            if self.use_wandb:
-                wandb_log = {f"val/{key}": value for key, value in logs.items()}
-                wandb_log["val/loss"] = loss.item()
-                wandb.log(wandb_log, step=self.global_step)
-        
-        avg_loss = val_loss / num_batches if num_batches > 0 else 0.0
-        
-        # Save best model
-        if avg_loss < self.best_val_loss and self.save_dir:
-            self.best_val_loss = avg_loss
-            self.save_checkpoint(epoch, is_best=True)
-            if self.use_wandb:
-                wandb.run.summary["best_val_loss"] = avg_loss
-        
-        return avg_loss
+class NeuronDataModule(LightningDataModule):
+    """PyTorch Lightning DataModule for neuron datasets."""
 
-    def save_checkpoint(self, epoch: int, is_best: bool = False, step: int | None = None):
-        """Save model checkpoint with trainer state for resuming."""
-        if not self.save_dir:
-            return
-        
-        self.save_dir.mkdir(parents=True, exist_ok=True)
-        
-        step = step if step is not None else self.global_step
-        checkpoint = {
-            "epoch": epoch,
-            "global_step": step,
-            "model_state_dict": self.model.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
-            "best_val_loss": self.best_val_loss,
-            "first_test_done": self.first_test_done,
-        }
-        
-        if self.lr_scheduler:
-            checkpoint["scheduler_state_dict"] = self.lr_scheduler.state_dict()
-        
-        torch.save(checkpoint, self.save_dir / "checkpoint.pt")
-        
-        if is_best:
-            torch.save(checkpoint, self.save_dir / "best_model.pt")
+    def __init__(
+        self,
+        data_dir: Path,
+        manifest_train: Path,
+        manifest_val: Optional[Path] = None,
+        manifest_test: Optional[Path] = None,
+        batch_size: int = 8,
+        num_workers: int = 4,
+        load_depth: bool = False,
+        load_recon: bool = False,
+        use_inpaint: bool = False,
+        inpaint_mask_type: str = "rect",
+        inpaint_mask_ratio: float = 0.25,
+        inpaint_min_size: float = 0.1,
+        inpaint_max_size: float = 0.3,
+    ):
+        super().__init__()
+        self.data_dir = Path(data_dir)
+        self.manifest_train = Path(manifest_train)
+        self.manifest_val = Path(manifest_val) if manifest_val else None
+        self.manifest_test = Path(manifest_test) if manifest_test else None
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.load_depth = load_depth
+        self.load_recon = load_recon
+        self.use_inpaint = use_inpaint
+        self.inpaint_mask_type = inpaint_mask_type
+        self.inpaint_mask_ratio = inpaint_mask_ratio
+        self.inpaint_min_size = inpaint_min_size
+        self.inpaint_max_size = inpaint_max_size
 
-        # Also save step-based checkpoint
-        if step is not None:
-            torch.save(checkpoint, self.save_dir / f"checkpoint_step_{step}.pt")
-    
-    def load_checkpoint(self, checkpoint_path: Path):
-        """Load checkpoint and resume training state."""
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        self.model.load_state_dict(checkpoint["model_state_dict"])
-        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        if self.lr_scheduler and "scheduler_state_dict" in checkpoint:
-            self.lr_scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-        self.start_epoch = checkpoint.get("epoch", 1) + 1
-        self.global_step = checkpoint.get("global_step", 0)
-        self.best_val_loss = checkpoint.get("best_val_loss", float("inf"))
-        self.first_test_done = checkpoint.get("first_test_done", False)
-        print(f"Resumed from checkpoint: epoch={checkpoint.get('epoch', 1)}, step={self.global_step}")
-    
-    @torch.no_grad()
-    def evaluate_test(self, epoch: int, save_outputs: bool = False):
-        """Evaluate on test set and optionally save outputs."""
-        if self.test_loader is None:
-            return
-        
-        self.model.eval()
-        test_loss = 0.0
-        num_batches = 0
-        outputs_to_save = []
-        
-        samples_collected = 0
-        for batch_idx, batch in enumerate(self.test_loader):
-            if samples_collected >= self.max_test_samples:
-                break
-            
-            batch_size = batch["input"].shape[0]
-            if samples_collected + batch_size > self.max_test_samples:
-                # Trim batch to exact number needed
-                trim_size = self.max_test_samples - samples_collected
-                batch = {k: v[:trim_size] for k, v in batch.items()}
-                batch_size = trim_size
-            
-            batch = {k: v.to(self.device) for k, v in batch.items()}
-            
-            outputs = self.model(batch["input"])
-            loss, logs = self.criterion(outputs, batch)
-            
-            test_loss += loss.item()
-            num_batches += 1
-            samples_collected += batch_size
-            
-            # Save outputs for first test evaluation
-            if save_outputs:
-                seg_pred = torch.argmax(outputs["seg_logits"], dim=1).cpu().numpy()
-                seg_gt = batch["seg"].cpu().numpy()
-                for i in range(batch_size):
-                    if len(outputs_to_save) >= self.max_test_samples:
-                        break
-                    output_dict = {
-                        "input": batch["input"][i].cpu().numpy(),
-                        "seg_pred": seg_pred[i],
-                        "seg_gt": seg_gt[i],
-                        "step": self.global_step,
-                    }
-                    if "depth" in outputs:
-                        output_dict["depth_pred"] = outputs["depth"][i].cpu().numpy()
-                    if "depth" in batch:
-                        output_dict["depth_gt"] = batch["depth"][i].cpu().numpy()
-                    outputs_to_save.append(output_dict)
-        
-        avg_loss = test_loss / num_batches if num_batches > 0 else 0.0
-        
-        if self.writer:
-            self.writer.add_scalar("test/loss", avg_loss, self.global_step)
-            for key, value in logs.items():
-                self.writer.add_scalar(f"test/{key}", value, self.global_step)
-        
-        if self.use_wandb:
-            wandb_log = {"test/loss": avg_loss}
-            for key, value in logs.items():
-                wandb_log[f"test/{key}"] = value
-            wandb.log(wandb_log, step=self.global_step)
-        
-        print(f"Test Loss (step {self.global_step}): {avg_loss:.4f}")
-        
-        # Save outputs to disk if requested
-        if save_outputs and outputs_to_save and self.save_dir:
-            output_dir = self.save_dir / "test_outputs" / f"step_{self.global_step}"
-            output_dir.mkdir(parents=True, exist_ok=True)
-            
-            for idx, output in enumerate(outputs_to_save):
-                np.savez_compressed(
-                    output_dir / f"sample_{idx:04d}.npz",
-                    **output
+    def setup(self, stage: str):
+        if stage == "fit":
+            self.train_dataset = NeuronDataset(
+                self.manifest_train,
+                self.data_dir,
+                load_depth=self.load_depth,
+                load_recon=self.load_recon,
+                use_inpaint=self.use_inpaint,
+                inpaint_mask_type=self.inpaint_mask_type,
+                inpaint_mask_ratio=self.inpaint_mask_ratio,
+                inpaint_min_size=self.inpaint_min_size,
+                inpaint_max_size=self.inpaint_max_size,
+            )
+            if self.manifest_val:
+                self.val_dataset = NeuronDataset(
+                    self.manifest_val,
+                    self.data_dir,
+                    load_depth=self.load_depth,
+                    load_recon=self.load_recon,
+                    use_inpaint=False,
                 )
-            print(f"Saved {len(outputs_to_save)} test outputs to {output_dir}")
+            else:
+                self.val_dataset = None
         
-        self.model.train()
+        if stage == "test":
+            if self.manifest_test:
+                self.test_dataset = NeuronDataset(
+                    self.manifest_test,
+                    self.data_dir,
+                    load_depth=self.load_depth,
+                    load_recon=self.load_recon,
+                    use_inpaint=False,
+                )
+            else:
+                self.test_dataset = None
 
-    def train(self, num_epochs: int, max_steps: int | None = None):
-        """Main training loop."""
-        for epoch in range(self.start_epoch, num_epochs + 1):
-            if max_steps is not None and self.global_step >= max_steps:
-                print(f"\nReached max_steps={max_steps}, stopping training.")
-                break
-            
-            print(f"\nEpoch {epoch}/{num_epochs} (Step {self.global_step})")
-            print("-" * 50)
-            
-            train_loss = self.train_epoch(epoch)
-            val_loss = self.validate(epoch)
-            
-            # ReduceLROnPlateau scheduler steps on validation loss
-            if self.lr_scheduler and isinstance(self.lr_scheduler, optim.lr_scheduler.ReduceLROnPlateau):
-                self.lr_scheduler.step(val_loss)
-            
-            print(f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
-            
-            if self.use_wandb:
-                wandb.log({
-                    "epoch": epoch,
-                    "epoch/train_loss": train_loss,
-                    "epoch/val_loss": val_loss,
-                    "epoch/learning_rate": self.optimizer.param_groups[0]["lr"],
-                }, step=epoch)
-            
-            # Check max_steps after epoch
-            if max_steps is not None and self.global_step >= max_steps:
-                print(f"\nReached max_steps={max_steps}, stopping training.")
-                break
-        
-        if self.writer:
-            self.writer.close()
-        
-        if self.use_wandb:
-            wandb.finish()
+    def train_dataloader(self):
+        return DataLoader(
+            self.train_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=self.num_workers,
+            collate_fn=collate_fn,
+        )
+
+    def val_dataloader(self):
+        if self.val_dataset is None:
+            return None
+        return DataLoader(
+            self.val_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            collate_fn=collate_fn,
+        )
+
+    def test_dataloader(self):
+        if self.test_dataset is None:
+            return None
+        return DataLoader(
+            self.test_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            collate_fn=collate_fn,
+        )
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train SegVAE2D model")
+    parser = argparse.ArgumentParser(description="Train SegVAE2D model with PyTorch Lightning")
     parser.add_argument("--data-dir", type=Path, required=True, help="Dataset directory")
-    parser.add_argument("--manifest", type=Path, required=True, help="Manifest JSONL file")
+    parser.add_argument("--manifest-train", type=Path, required=True, help="Training manifest JSONL file")
+    parser.add_argument("--manifest-val", type=Path, default=None, help="Validation manifest JSONL file")
+    parser.add_argument("--manifest-test", type=Path, default=None, help="Test manifest JSONL file")
     parser.add_argument("--save-dir", type=Path, default=Path("checkpoints"), help="Checkpoint directory")
     parser.add_argument("--log-dir", type=Path, default=Path("logs"), help="Log directory")
     
-    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--max-epochs", type=int, default=100, help="Maximum number of epochs")
+    parser.add_argument("--max-steps", type=int, default=None, help="Maximum number of training steps")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
@@ -491,190 +455,158 @@ def main():
     parser.add_argument("--base-channels", type=int, default=64)
     parser.add_argument("--num-classes", type=int, default=4)
     parser.add_argument("--latent-channels", type=int, default=128)
+    parser.add_argument("--skip-latent-mult", type=float, default=0.5, help="Multiplicative factor for skip connection latent size (default: 0.5)")
+    parser.add_argument("--skip-mode", type=str, default="variational", choices=["variational", "raw", "drop"], help="Skip connection mode: variational (stochastic), raw (identity), drop (zero)")
+    parser.add_argument("--free-nats", type=float, default=0.0, help="Free-bits (nats) applied to KL terms (default: 0.0)")
+    parser.add_argument("--beta", type=float, default=1.0, help="KL annealing multiplier for all KL terms (default: 1.0)")
     parser.add_argument("--use-depth", action="store_true")
     parser.add_argument("--use-recon", action="store_true")
-    parser.add_argument("--kld-weight", type=float, default=1.0)
+    parser.add_argument("--use-inpaint", action="store_true", help="Enable inpainting masks for reconstruction (only applies to training set)")
+    parser.add_argument("--inpaint-mask-type", type=str, default="rect", choices=["rect", "random", "center"], help="Type of inpainting mask: rect (random rectangles), random (random pixels), center (center rectangle)")
+    parser.add_argument("--inpaint-mask-ratio", type=float, default=0.25, help="Ratio of pixels to mask for 'random' mask type (default: 0.25)")
+    parser.add_argument("--inpaint-min-size", type=float, default=0.1, help="Minimum size of mask patches as fraction of image (default: 0.1)")
+    parser.add_argument("--inpaint-max-size", type=float, default=0.3, help="Maximum size of mask patches as fraction of image (default: 0.3)")
+    parser.add_argument("--kld-weight", type=float, default=0.1, help="KL divergence weight (default: 0.1, lower due to variational skip connections)")
     
     parser.add_argument("--lambda-seg", type=float, default=1.0)
     parser.add_argument("--lambda-depth", type=float, default=1.0)
     parser.add_argument("--lambda-recon", type=float, default=1.0)
     
-    # Weights & Biases arguments
     parser.add_argument("--use-wandb", action="store_true", help="Enable Weights & Biases logging")
     parser.add_argument("--wandb-project", type=str, default="axonet-segvae2d", help="W&B project name")
-    parser.add_argument("--wandb-name", type=str, default=None, help="W&B run name (default: auto-generated)")
+    parser.add_argument("--wandb-name", type=str, default=None, help="W&B run name")
     
-    # Training control arguments
-    parser.add_argument("--test-ratio", type=float, default=0.1, help="Test set ratio (default: 0.1)")
-    parser.add_argument("--val-ratio", type=float, default=0.1, help="Validation set ratio (default: 0.1)")
-    parser.add_argument("--split-seed", type=int, default=42, help="Random seed for train/val/test split")
-    parser.add_argument("--checkpoint-step", type=int, default=100, help="Save checkpoint every N steps (default: 100)")
-    parser.add_argument("--test-step", type=int, default=100, help="Evaluate test set every N steps (default: 100)")
-    parser.add_argument("--max-test-samples", type=int, default=50, help="Maximum test samples to evaluate (default: 50)")
+    parser.add_argument("--checkpoint-step", type=int, default=1000, help="Save checkpoint every N steps")
+    parser.add_argument("--val-check-interval", type=float, default=1.0, help="Run validation every N steps (int) or fraction of epoch (float, default: 1.0 = end of epoch)")
+    parser.add_argument("--log-every-n-steps", type=int, default=10, help="Log metrics every N training steps (default: 10)")
     parser.add_argument("--resume", type=Path, default=None, help="Resume from checkpoint file")
-    parser.add_argument("--max-steps", type=int, default=None, help="Maximum training steps (overrides epochs)")
     
-    # LR scheduler arguments
-    parser.add_argument("--lr-scheduler", type=str, default="cosine", choices=["cosine", "plateau", "step", "none"], help="LR scheduler type (default: cosine)")
-    parser.add_argument("--lr-warmup-steps", type=int, default=1000, help="Warmup steps for cosine scheduler (default: 1000)")
-    parser.add_argument("--lr-t-max", type=int, default=10000, help="T_max for cosine scheduler (default: 10000)")
-    parser.add_argument("--lr-eta-min", type=float, default=1e-6, help="Minimum LR for cosine scheduler (default: 1e-6)")
+    parser.add_argument("--lr-scheduler", type=str, default="cosine", choices=["cosine", "plateau", "step", "none"], help="LR scheduler type")
+    parser.add_argument("--lr-t-max", type=int, default=10000, help="T_max for cosine scheduler")
+    parser.add_argument("--lr-eta-min", type=float, default=1e-6, help="Minimum LR for cosine scheduler")
+    
+    parser.add_argument("--accelerator", type=str, default="auto", help="Accelerator type (auto, gpu, cpu, mps)")
+    parser.add_argument("--devices", type=int, default=1, help="Number of devices")
+    parser.add_argument("--precision", type=str, default="32", choices=["16", "32", "bf16"], help="Precision")
     
     args = parser.parse_args()
     
-    # Device selection: prefer MPS (Apple Metal) > CUDA > CPU
-    if torch.backends.mps.is_available():
-        device = "mps"
-    elif torch.cuda.is_available():
-        device = "cuda"
-    else:
-        device = "cpu"
-    print(f"Using device: {device}")
-    
-    # Create datasets
-    dataset = NeuronDataset(
-        args.manifest,
-        args.data_dir,
+    data_module = NeuronDataModule(
+        data_dir=args.data_dir,
+        manifest_train=args.manifest_train,
+        manifest_val=args.manifest_val,
+        manifest_test=args.manifest_test,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
         load_depth=args.use_depth,
         load_recon=args.use_recon,
+        use_inpaint=args.use_inpaint,
+        inpaint_mask_type=args.inpaint_mask_type,
+        inpaint_mask_ratio=args.inpaint_mask_ratio,
+        inpaint_min_size=args.inpaint_min_size,
+        inpaint_max_size=args.inpaint_max_size,
     )
     
-    # Create train/val/test splits with seed for reproducibility
-    generator = torch.Generator().manual_seed(args.split_seed)
-    total_size = len(dataset)
-    test_size = int(args.test_ratio * total_size)
-    val_size = int(args.val_ratio * total_size)
-    train_size = total_size - val_size - test_size
-    
-    train_dataset, val_dataset, test_dataset = torch.utils.data.random_split(
-        dataset, [train_size, val_size, test_size], generator=generator
-    )
-    
-    print(f"Dataset splits: train={len(train_dataset)}, val={len(val_dataset)}, test={len(test_dataset)}")
-    
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        collate_fn=collate_fn,
-    )
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        collate_fn=collate_fn,
-    )
-    
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        collate_fn=collate_fn,
-    )
-    
-    # Create model
-    model = build_model(
+    model = SegVAE2DLightning(
         in_channels=args.in_channels,
         base_channels=args.base_channels,
         num_classes=args.num_classes,
         latent_channels=args.latent_channels,
+        skip_latent_mult=args.skip_latent_mult,
         use_depth=args.use_depth,
         use_recon=args.use_recon,
         kld_weight=args.kld_weight,
-    )
-    
-    # Create criterion
-    criterion = MultiTaskLoss(
+        skip_mode=args.skip_mode,
+        free_nats=args.free_nats,
+        beta=args.beta,
         lambda_seg=args.lambda_seg,
         lambda_depth=args.lambda_depth,
         lambda_recon=args.lambda_recon,
-    )
-    
-    # Create optimizer
-    optimizer = optim.AdamW(
-        model.parameters(),
         lr=args.lr,
         weight_decay=args.weight_decay,
+        lr_scheduler=args.lr_scheduler,
+        lr_t_max=args.lr_t_max,
+        lr_eta_min=args.lr_eta_min,
     )
     
-    # Create LR scheduler
-    lr_scheduler = None
-    if args.lr_scheduler == "cosine":
-        # Cosine annealing with warm restarts (step-based)
-        lr_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=args.lr_t_max,
-            eta_min=args.lr_eta_min,
-        )
-    elif args.lr_scheduler == "plateau":
-        # Reduce on plateau (epoch-based, steps on validation loss)
-    lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="min",
-        factor=0.5,
-        patience=10,
-        )
-    elif args.lr_scheduler == "step":
-        # Step decay (step-based)
-        lr_scheduler = optim.lr_scheduler.StepLR(
-            optimizer,
-            step_size=5000,
-            gamma=0.5,
-    )
-    # else: "none" - no scheduler
+    callbacks = [
+        ModelCheckpoint(
+            dirpath=args.save_dir,
+            filename="checkpoint-{epoch:03d}-{step:06d}",
+            every_n_train_steps=args.checkpoint_step,
+            save_top_k=0,
+            save_last=False,
+        ),
+        ModelCheckpoint(
+            dirpath=args.save_dir,
+            filename="best-{epoch:03d}-{step:06d}",
+            monitor="val/loss" if args.manifest_val else "train/loss",
+            mode="min",
+            save_top_k=3,
+            save_last=True,
+        ),
+        LearningRateMonitor(logging_interval="step"),
+    ]
     
-    # Create trainer
-    trainer = Trainer(
-        model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        criterion=criterion,
-        optimizer=optimizer,
-        lr_scheduler=lr_scheduler,
-        test_loader=test_loader,
-        device=device,
-        save_dir=args.save_dir,
-        log_dir=args.log_dir,
-        checkpoint_step=args.checkpoint_step,
-        test_step=args.test_step,
-        max_test_samples=args.max_test_samples,
-    )
+    loggers = []
+    if args.log_dir:
+        loggers.append(TensorBoardLogger(save_dir=str(args.log_dir.parent), name=args.log_dir.name))
     
-    # Resume from checkpoint if specified
-    if args.resume:
-        trainer.load_checkpoint(args.resume)
-    
-    # Initialize Weights & Biases if requested
     if args.use_wandb:
-        wandb_config = {
-            "epochs": args.epochs,
-            "batch_size": args.batch_size,
-            "lr": args.lr,
-            "weight_decay": args.weight_decay,
-            "in_channels": args.in_channels,
-            "base_channels": args.base_channels,
-            "num_classes": args.num_classes,
-            "latent_channels": args.latent_channels,
-            "use_depth": args.use_depth,
-            "use_recon": args.use_recon,
-            "kld_weight": args.kld_weight,
-            "lambda_seg": args.lambda_seg,
-            "lambda_depth": args.lambda_depth,
-            "lambda_recon": args.lambda_recon,
-            "device": device,
-            "num_train_samples": len(train_dataset),
-            "num_val_samples": len(val_dataset),
-        }
-        trainer.init_wandb(project=args.wandb_project, name=args.wandb_name, config=wandb_config)
+        loggers.append(WandbLogger(
+            project=args.wandb_project,
+            name=args.wandb_name,
+            log_model=False,
+        ))
     
-    # Train
-    trainer.train(args.epochs, max_steps=args.max_steps)
+    trainer_kwargs = {
+        "max_epochs": args.max_epochs,
+        "accelerator": args.accelerator,
+        "devices": args.devices,
+        "precision": args.precision,
+        "callbacks": callbacks,
+        "logger": loggers if loggers else True,
+        "log_every_n_steps": args.log_every_n_steps,
+        "val_check_interval": args.val_check_interval,
+    }
+    
+    if args.max_steps is not None:
+        trainer_kwargs["max_steps"] = args.max_steps
+    
+    trainer = Trainer(**trainer_kwargs)
+    
+    training_started = False
+    
+    try:
+        trainer.fit(
+            model,
+            data_module,
+            ckpt_path=str(args.resume) if args.resume else None,
+        )
+    except KeyboardInterrupt:
+        print("\nTraining interrupted by user (Ctrl-C)")
+        training_started = True
+    except Exception as e:
+        print(f"\nTraining interrupted by exception: {e}")
+        training_started = True
+        raise
+    finally:
+        if training_started:
+            current_global_step = getattr(trainer, 'global_step', 0)
+            current_epoch = getattr(trainer, 'current_epoch', 0)
+            
+            if current_global_step > 0 or current_epoch > 0:
+                print(f"\nSaving emergency checkpoint (epoch {current_epoch}, step {current_global_step})...")
+                args.save_dir.mkdir(parents=True, exist_ok=True)
+                emergency_checkpoint_path = args.save_dir / f"emergency-checkpoint-epoch-{current_epoch:03d}-step-{current_global_step:06d}.ckpt"
+                trainer.save_checkpoint(str(emergency_checkpoint_path))
+                print(f"Emergency checkpoint saved to: {emergency_checkpoint_path}")
+            else:
+                print("\nNo training progress detected, skipping emergency checkpoint.")
+    
+    if args.manifest_test:
+        trainer.test(model, data_module)
 
 
 if __name__ == "__main__":
     main()
-
