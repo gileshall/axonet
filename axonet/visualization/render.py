@@ -1,118 +1,72 @@
 """
-Neuro Render Core — UI-agnostic OpenGL renderer for SWC neurons
+Neuro Render Core — ModernGL-based renderer for SWC neurons
 
-This module cleanly separates **rendering/scene math** from any UI code.
-It can be used by:
-  1) an interactive UI (e.g., pyglet window w/ events), and
-  2) a headless dataset generator (offscreen renders to numpy arrays / PNGs).
+This module provides UI-agnostic OpenGL rendering using ModernGL for cleaner
+resource management and reduced boilerplate.
 
 Key concepts
 ------------
-• OffscreenContext: minimal GL context manager (visible window or headless).
-• NeuroRenderCore: loads SWC, builds triangle meshes, manages camera, 
+• OffscreenContext: ModernGL standalone context wrapper
+• NeuroRenderCore: loads SWC, builds triangle meshes, manages camera,
   draws with orthographic/perspective projection, and computes QC metrics.
-• No input handling, no buttons, no window events — pure engine.
 
 Dependencies
 ------------
-- numpy, pyglet, and your project-local modules:
+- numpy, moderngl, and project-local modules:
     from .mesh import MeshRenderer
     from ..io import load_swc, NeuronClass
-
-Notes
------
-- For headless: set pyglet.options["headless"] = True **before** importing pyglet.gl
-  (You can toggle this via OffscreenContext(headless=True)).
-- Color management: outputs linear to sRGB framebuffer if available; offscreen
-  FBO path converts to 8-bit RGBA.
 """
 
 from __future__ import annotations
-import os
-import pyglet
-
-# headless requiures EGL, OSX does not have it
-#if os.environ.get("AXONET_HEADLESS", "0").lower() in ("1", "true", "yes", "y", "t"):
-#   pyglet.options["headless"] = True
-#
-# screen sleep might be to blame
-# caffeinate -dims python -m axonet.training.dataset_generator ...
-
 import math
-import ctypes
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Dict, Iterable, Optional, Tuple, Union
+from typing import Dict, Optional, Tuple, Union
 
 import numpy as np
-import pyglet
-from pyglet import gl
+import moderngl
 
-# ---- Project-local imports ----
 from .mesh import MeshRenderer
 from ..io import load_swc, NeuronClass
 
 COLORS = {
-    'red': np.array([1.0, 0.0, 0.0]).astype(np.float32),
-    'green': np.array([0.0, 1.0, 0.0]).astype(np.float32),
-    'blue': np.array([0.0, 0.0, 1.0]).astype(np.float32),
-    'yellow': np.array([1.0, 1.0, 0.0]).astype(np.float32),
-    'purple': np.array([1.0, 0.0, 1.0]).astype(np.float32),
-    'orange': np.array([1.0, 0.5, 0.0]).astype(np.float32),
-    'brown': np.array([0.5, 0.25, 0.0]).astype(np.float32),
-    'gray': np.array([0.5, 0.5, 0.5]).astype(np.float32),
-    'black': np.array([0.0, 0.0, 0.0]).astype(np.float32),
-    'white': np.array([1.0, 1.0, 1.0]).astype(np.float32),
+    'red': np.array([1.0, 0.0, 0.0], dtype=np.float32),
+    'green': np.array([0.0, 1.0, 0.0], dtype=np.float32),
+    'blue': np.array([0.0, 0.0, 1.0], dtype=np.float32),
+    'yellow': np.array([1.0, 1.0, 0.0], dtype=np.float32),
+    'purple': np.array([1.0, 0.0, 1.0], dtype=np.float32),
+    'orange': np.array([1.0, 0.5, 0.0], dtype=np.float32),
+    'brown': np.array([0.5, 0.25, 0.0], dtype=np.float32),
+    'gray': np.array([0.5, 0.5, 0.5], dtype=np.float32),
+    'black': np.array([0.0, 0.0, 0.0], dtype=np.float32),
+    'white': np.array([1.0, 1.0, 1.0], dtype=np.float32),
 }
 
 # ============================ Math helpers ============================
 
 def majority_pool_uint8(mask_hi: np.ndarray, factor: int, *, prefer_nonzero: bool = True) -> np.ndarray:
     """Downsample (H*factor, W*factor) -> (H, W) by majority voting within each factor×factor block.
-    Vectorized implementation - 10-50x faster than nested loops.
-    
-    Args:
-        mask_hi: uint8 array of shape (H*factor, W*factor)
-        factor: Downsampling factor (must divide image dimensions)
-        prefer_nonzero: If True, prefer nonzero labels over background (0) in ties
-    
-    Returns:
-        uint8 array of shape (H, W) with majority vote per block
+    Vectorized implementation.
     """
-    from scipy.stats import mode
-    
     Hh, Wh = mask_hi.shape
     assert Hh % factor == 0 and Wh % factor == 0, f"Supersample factor {factor} must divide image size ({Hh}, {Wh})"
     H, W = Hh // factor, Wh // factor
-
     blocks = mask_hi.reshape(H, factor, W, factor).transpose(0, 2, 1, 3).reshape(H, W, -1)
 
     if prefer_nonzero:
-        result = blocks.max(axis=2).astype(np.uint8)
+        return blocks.max(axis=2).astype(np.uint8)
     else:
+        from scipy.stats import mode
         result, _ = mode(blocks, axis=2, keepdims=False)
-        result = result.astype(np.uint8)
+        return result.astype(np.uint8)
 
-    return result
 
 def average_pool_depth(depth_hi: np.ndarray, factor: int, *, prefer_valid: bool = True, background_threshold: float = 0.999) -> np.ndarray:
-    """Downsample (H*factor, W*factor) -> (H, W) by averaging depth within each factor×factor block.
-    Vectorized implementation - 10-50x faster than nested loops.
-    
-    Args:
-        depth_hi: float32 array of shape (H*factor, W*factor) with depth values in [0, 1]
-        factor: Downsampling factor (must divide image dimensions)
-        prefer_valid: If True, prefer valid depth values over background in averaging
-        background_threshold: Values >= this threshold are considered background
-    
-    Returns:
-        float32 array of shape (H, W) with averaged depth per block
-    """
+    """Downsample (H*factor, W*factor) -> (H, W) by averaging depth. Vectorized implementation."""
     Hh, Wh = depth_hi.shape
     assert Hh % factor == 0 and Wh % factor == 0, f"Supersample factor {factor} must divide image size ({Hh}, {Wh})"
     H, W = Hh // factor, Wh // factor
-
     blocks = depth_hi.reshape(H, factor, W, factor).transpose(0, 2, 1, 3).reshape(H, W, -1)
 
     if prefer_valid:
@@ -125,6 +79,7 @@ def average_pool_depth(depth_hi: np.ndarray, factor: int, *, prefer_valid: bool 
         result = blocks.mean(axis=2)
 
     return result.astype(np.float32)
+
 
 def perspective(fovy_deg: float, aspect: float, znear: float, zfar: float) -> np.ndarray:
     f = 1.0 / math.tan(math.radians(fovy_deg) * 0.5)
@@ -187,32 +142,30 @@ def _aabb_corners(bmin: np.ndarray, bmax: np.ndarray) -> np.ndarray:
 
 # ========================= Shader sources =========================
 
-VERT_SRC = b"""
+VERT_SRC = """
 #version 330 core
-layout(location=0) in vec3 position;
+in vec3 in_position;
 
-uniform mat4 u_model;
-uniform mat4 u_view;
-uniform mat4 u_proj;
+uniform mat4 u_mvp;
+uniform mat4 u_mv;
 
 flat out float v_viewz;
 
 void main(){
-    vec4 world = u_model * vec4(position, 1.0);
-    vec4 viewpos = u_view * world;
+    vec4 viewpos = u_mv * vec4(in_position, 1.0);
     v_viewz = viewpos.z;
-    gl_Position = u_proj * viewpos;
+    gl_Position = u_mvp * vec4(in_position, 1.0);
 }
 """
 
-FRAG_SRC_RGBA = b"""
+FRAG_SRC_RGBA = """
 #version 330 core
 flat in float v_viewz;
 
 uniform vec3 u_color;
 uniform float u_depth_near;
 uniform float u_depth_far;
-uniform int  u_render_mode; // 0=color, 1=depth-to-color
+uniform int u_render_mode;
 
 out vec4 FragColor;
 
@@ -222,33 +175,18 @@ void main(){
         FragColor = vec4(d, d, d, 1.0);
         return;
     }
-
-    vec3 color = u_color;
-    FragColor = vec4(color, 1.0);
+    FragColor = vec4(u_color, 1.0);
 }
 """
 
-FRAG_SRC_INTEGER = b"""
-#version 330 core
-
-uniform int u_class_id;  // class id for mask mode (0-255)
-
-out uint FragColor;  // Single uint output for integer IDs
-
-void main(){
-    FragColor = uint(u_class_id);
-}
-"""
-
-# Depth-only fragment shader writing linearized depth to a single-channel float target
-FRAG_SRC_DEPTH = b"""
+FRAG_SRC_DEPTH = """
 #version 330 core
 flat in float v_viewz;
 
 uniform float u_depth_near;
 uniform float u_depth_far;
 
-layout(location=0) out float FragDepth;
+out float FragDepth;
 
 void main(){
     float d = clamp(((-v_viewz) - u_depth_near) / max(1e-6, (u_depth_far - u_depth_near)), 0.0, 1.0);
@@ -256,114 +194,35 @@ void main(){
 }
 """
 
-# ======================== GL utility helpers ========================
+FRAG_SRC_INTEGER = """
+#version 330 core
 
-def _as_glmat(m: np.ndarray):
-    m = np.asarray(m, dtype=np.float32)
-    return (gl.GLfloat * 16)(*m.flatten())
+uniform int u_class_id;
 
+out uint FragColor;
 
-def _compile(source_bytes: bytes, shader_type):
-    shader = gl.glCreateShader(shader_type)
-    src = ctypes.create_string_buffer(source_bytes)
-    src_ptr = ctypes.cast(ctypes.pointer(ctypes.pointer(src)), ctypes.POINTER(ctypes.POINTER(gl.GLchar)))
-    gl.glShaderSource(shader, 1, src_ptr, None)
-    gl.glCompileShader(shader)
-
-    ok = gl.GLint()
-    gl.glGetShaderiv(shader, gl.GL_COMPILE_STATUS, ctypes.byref(ok))
-    if not ok.value:
-        log_len = gl.GLint()
-        gl.glGetShaderiv(shader, gl.GL_INFO_LOG_LENGTH, ctypes.byref(log_len))
-        log = ctypes.create_string_buffer(max(1, log_len.value))
-        gl.glGetShaderInfoLog(shader, log_len, None, log)
-        raise RuntimeError(f"Shader compile error ({shader_type}):\n{log.value.decode()}")
-    return shader
-
-
-def _make_program_rgba():
-    """Create shader program for RGBA rendering."""
-    vs = _compile(VERT_SRC, gl.GL_VERTEX_SHADER)
-    fs = _compile(FRAG_SRC_RGBA, gl.GL_FRAGMENT_SHADER)
-    prog = gl.glCreateProgram()
-    gl.glAttachShader(prog, vs)
-    gl.glAttachShader(prog, fs)
-    gl.glLinkProgram(prog)
-
-    ok = gl.GLint()
-    gl.glGetProgramiv(prog, gl.GL_LINK_STATUS, ctypes.byref(ok))
-    if not ok.value:
-        log_len = gl.GLint()
-        gl.glGetProgramiv(prog, gl.GL_INFO_LOG_LENGTH, ctypes.byref(log_len))
-        log = ctypes.create_string_buffer(max(1, log_len.value))
-        gl.glGetProgramInfoLog(prog, log_len, None, log)
-        raise RuntimeError("Program link error:\n" + log.value.decode())
-
-    gl.glDeleteShader(vs)
-    gl.glDeleteShader(fs)
-    return prog
-
-def _make_program_integer():
-    """Create shader program for integer ID rendering."""
-    vs = _compile(VERT_SRC, gl.GL_VERTEX_SHADER)
-    fs = _compile(FRAG_SRC_INTEGER, gl.GL_FRAGMENT_SHADER)
-    prog = gl.glCreateProgram()
-    gl.glAttachShader(prog, vs)
-    gl.glAttachShader(prog, fs)
-    gl.glLinkProgram(prog)
-
-    ok = gl.GLint()
-    gl.glGetProgramiv(prog, gl.GL_LINK_STATUS, ctypes.byref(ok))
-    if not ok.value:
-        log_len = gl.GLint()
-        gl.glGetProgramiv(prog, gl.GL_INFO_LOG_LENGTH, ctypes.byref(log_len))
-        log = ctypes.create_string_buffer(max(1, log_len.value))
-        gl.glGetProgramInfoLog(prog, log_len, None, log)
-        raise RuntimeError("Program link error:\n" + log.value.decode())
-
-    gl.glDeleteShader(vs)
-    gl.glDeleteShader(fs)
-    return prog
-
-def _make_program_depth():
-    """Create shader program for float depth rendering to GL_R32F target."""
-    vs = _compile(VERT_SRC, gl.GL_VERTEX_SHADER)
-    fs = _compile(FRAG_SRC_DEPTH, gl.GL_FRAGMENT_SHADER)
-    prog = gl.glCreateProgram()
-    gl.glAttachShader(prog, vs)
-    gl.glAttachShader(prog, fs)
-    gl.glLinkProgram(prog)
-
-    ok = gl.GLint()
-    gl.glGetProgramiv(prog, gl.GL_LINK_STATUS, ctypes.byref(ok))
-    if not ok.value:
-        log_len = gl.GLint()
-        gl.glGetProgramiv(prog, gl.GL_INFO_LOG_LENGTH, ctypes.byref(log_len))
-        log = ctypes.create_string_buffer(max(1, log_len.value))
-        gl.glGetProgramInfoLog(prog, log_len, None, log)
-        raise RuntimeError("Program link error:\n" + log.value.decode())
-
-    gl.glDeleteShader(vs)
-    gl.glDeleteShader(fs)
-    return prog
+void main(){
+    FragColor = uint(u_class_id);
+}
+"""
 
 # ============================ Core types ============================
 
 class RenderMode(Enum):
-    """Render output modes."""
     COLOR = 0
     DEPTH_TO_COLOR = 1
     CLASS_ID_INTEGER = 3
 
+
 @dataclass
 class RenderConfig:
-    """Configuration for rendering."""
     mode: RenderMode
     background: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
     class_to_id: Optional[Dict[str, int]] = None
     disable_srgb: bool = False
     disable_blend: bool = False
     disable_cull: bool = False
+
 
 @dataclass
 class Camera:
@@ -389,45 +248,21 @@ class DrawRange:
 
 
 class OffscreenContext:
-    """A tiny GL context manager. Use visible=False for headless rendering."""
+    """ModernGL standalone context wrapper."""
 
-    def __init__(self, width: int, height: int, *, visible: bool = False, samples: int = 16):
+    def __init__(self, width: int, height: int, *, visible: bool = False, samples: int = 0):
         self.width = int(width)
         self.height = int(height)
         self.visible = bool(visible)
         self.samples = int(samples)
-        self.window = None
-        self._ctx = None
-        # sRGB + MSAA config if available
-        cfg = gl.Config(double_buffer=True, depth_size=24, sample_buffers=1 if samples > 1 else 0, samples=samples,
-                        major_version=3, minor_version=3, forward_compatible=True)
-        # Create a window-backed context (visible or hidden); this avoids Cocoa canvas issues
-        self.window = pyglet.window.Window(self.width, self.height, "NeuroRenderCore", visible=self.visible, config=cfg)
-        gl.glEnable(gl.GL_FRAMEBUFFER_SRGB)
-        gl.glViewport(0, 0, self.width, self.height)
-        gl.glEnable(gl.GL_DEPTH_TEST)
-        gl.glEnable(gl.GL_CULL_FACE)
-        gl.glCullFace(gl.GL_BACK)
-        if samples > 1:
-            print("MSAA is configured and enabled")
-            gl.glEnable(gl.GL_MULTISAMPLE)
-
-    def make_current(self):
-        # Ensure the appropriate context is current
-        if self.visible and self.window is not None:
-            # Windowed contexts are current by default in pyglet
-            return
-        if self._ctx is not None and hasattr(self._ctx, 'set_current'):
-            self._ctx.set_current()
+        self.ctx = moderngl.create_standalone_context(require=330)
+        self.ctx.enable(moderngl.DEPTH_TEST)
+        self.ctx.enable(moderngl.CULL_FACE)
 
     def close(self):
-        if self.window:
-            self.window.close()
-            self.window = None
-        if self._ctx is not None:
-            if hasattr(self._ctx, 'destroy'):
-                self._ctx.destroy()
-            self._ctx = None
+        if self.ctx:
+            self.ctx.release()
+            self.ctx = None
 
     def __enter__(self):
         return self
@@ -435,97 +270,23 @@ class OffscreenContext:
     def __exit__(self, exc_type, exc, tb):
         self.close()
 
-    def create_integer_fbo(self) -> Tuple[int, int, int]:
-        """Create integer FBO for MSAA-safe ID rendering.
-        Returns (fbo_id, color_tex_id, depth_rbo_id).
-        """
-        fbo = gl.GLuint()
-        gl.glGenFramebuffers(1, ctypes.byref(fbo))
-        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, fbo)
-        
-        # Create integer color texture
-        color_tex = gl.GLuint()
-        gl.glGenTextures(1, ctypes.byref(color_tex))
-        # For integer IDs, disable MSAA to avoid format compatibility issues
-        # Use single-sample rendering for pixel-perfect integer IDs
-        gl.glBindTexture(gl.GL_TEXTURE_2D, color_tex)
-        gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_R8UI, self.width, self.height, 0, 
-                      gl.GL_RED_INTEGER, gl.GL_UNSIGNED_BYTE, None)
-        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_NEAREST)
-        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_NEAREST)
-        gl.glFramebufferTexture2D(gl.GL_FRAMEBUFFER, gl.GL_COLOR_ATTACHMENT0, 
-                                gl.GL_TEXTURE_2D, color_tex, 0)
-        
-        # Create depth renderbuffer
-        depth_rbo = gl.GLuint()
-        gl.glGenRenderbuffers(1, ctypes.byref(depth_rbo))
-        gl.glBindRenderbuffer(gl.GL_RENDERBUFFER, depth_rbo)
-        # Use single-sample depth buffer for integer FBOs
-        gl.glRenderbufferStorage(gl.GL_RENDERBUFFER, gl.GL_DEPTH_COMPONENT24, 
-                               self.width, self.height)
-        gl.glFramebufferRenderbuffer(gl.GL_FRAMEBUFFER, gl.GL_DEPTH_ATTACHMENT, 
-                                   gl.GL_RENDERBUFFER, depth_rbo)
-        
-        # Check completeness
-        status = gl.glCheckFramebufferStatus(gl.GL_FRAMEBUFFER)
-        if status != gl.GL_FRAMEBUFFER_COMPLETE:
-            raise RuntimeError(f"Integer FBO incomplete: {status}")
-        
-        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, 0)
-        return int(fbo.value), int(color_tex.value), int(depth_rbo.value)
 
 class NeuroRenderCore:
-    """UI-agnostic renderer for SWC neurons.
-
-    Typical use:
-        with OffscreenContext(W, H, visible=False) as ctx:
-            core = NeuroRenderCore(ctx)
-            core.load_swc(path)
-            core.fit_camera(margin=1.15)
-            rgba = core.render_rgba()   # np.uint8 [H, W, 4]
-            qc = core.qc_fraction_in_frame()
-    """
+    """ModernGL-based renderer for SWC neurons."""
 
     def __init__(self, ctx: OffscreenContext):
         self.ctx = ctx
-        self.program_rgba = _make_program_rgba()
-        self.program_integer = _make_program_integer()
-        self.program_depth = _make_program_depth()
+        self.gl = ctx.ctx
 
-        # RGBA program uniforms
-        self.uni_model_rgba = gl.glGetUniformLocation(self.program_rgba, b"u_model")
-        self.uni_view_rgba = gl.glGetUniformLocation(self.program_rgba, b"u_view")
-        self.uni_proj_rgba = gl.glGetUniformLocation(self.program_rgba, b"u_proj")
-        self.uni_color_rgba = gl.glGetUniformLocation(self.program_rgba, b"u_color")
-        self.uni_depth_near_rgba = gl.glGetUniformLocation(self.program_rgba, b"u_depth_near")
-        self.uni_depth_far_rgba = gl.glGetUniformLocation(self.program_rgba, b"u_depth_far")
-        self.uni_render_mode_rgba = gl.glGetUniformLocation(self.program_rgba, b"u_render_mode")
+        self.prog_rgba = self.gl.program(vertex_shader=VERT_SRC, fragment_shader=FRAG_SRC_RGBA)
+        self.prog_depth = self.gl.program(vertex_shader=VERT_SRC, fragment_shader=FRAG_SRC_DEPTH)
+        self.prog_integer = self.gl.program(vertex_shader=VERT_SRC, fragment_shader=FRAG_SRC_INTEGER)
 
-        # Integer program uniforms
-        self.uni_model_int = gl.glGetUniformLocation(self.program_integer, b"u_model")
-        self.uni_view_int = gl.glGetUniformLocation(self.program_integer, b"u_view")
-        self.uni_proj_int = gl.glGetUniformLocation(self.program_integer, b"u_proj")
-        self.uni_class_id_int = gl.glGetUniformLocation(self.program_integer, b"u_class_id")
+        self.vbo: Optional[moderngl.Buffer] = None
+        self.vao_rgba: Optional[moderngl.VertexArray] = None
+        self.vao_depth: Optional[moderngl.VertexArray] = None
+        self.vao_integer: Optional[moderngl.VertexArray] = None
 
-        # Depth program uniforms
-        self.uni_model_depth = gl.glGetUniformLocation(self.program_depth, b"u_model")
-        self.uni_view_depth = gl.glGetUniformLocation(self.program_depth, b"u_view")
-        self.uni_proj_depth = gl.glGetUniformLocation(self.program_depth, b"u_proj")
-        self.uni_depth_near_depth = gl.glGetUniformLocation(self.program_depth, b"u_depth_near")
-        self.uni_depth_far_depth = gl.glGetUniformLocation(self.program_depth, b"u_depth_far")
-
-        # buffers
-        self.vao = gl.GLuint()
-        gl.glGenVertexArrays(1, ctypes.byref(self.vao))
-        gl.glBindVertexArray(self.vao)
-        self.vbo_pos = gl.GLuint()
-        gl.glGenBuffers(1, ctypes.byref(self.vbo_pos))
-        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.vbo_pos)
-        gl.glEnableVertexAttribArray(0)
-        gl.glVertexAttribPointer(0, 3, gl.GL_FLOAT, gl.GL_FALSE, 0, ctypes.c_void_p(0))
-        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, 0)
-
-        # scene data
         self.neuron = None
         self.draw_ranges: list[DrawRange] = []
         self.vertex_count = 0
@@ -534,7 +295,6 @@ class NeuroRenderCore:
         self.center = np.zeros(3, dtype=np.float32)
         self.diag = 1.0
 
-        # camera
         self.camera = Camera(
             eye=np.array([0.0, 0.0, 3.0], dtype=np.float32),
             target=np.array([0.0, 0.0, 0.0], dtype=np.float32),
@@ -542,9 +302,8 @@ class NeuroRenderCore:
         )
         self.aspect = max(1e-6, self.ctx.width / float(self.ctx.height))
 
-        # style options
         self.depth_shading = False
-        self.color_mode = 0  # 0 single, 1 by type
+        self.color_mode = 0
         self.layer_visible: Dict[str, bool] = {
             NeuronClass.SOMA.name: True,
             NeuronClass.AXON.name: True,
@@ -553,7 +312,6 @@ class NeuroRenderCore:
             NeuronClass.OTHER.name: True,
         }
 
-        # colors
         self._cls_colors: Dict[str, np.ndarray] = {
             NeuronClass.SOMA.name: COLORS['red'],
             NeuronClass.AXON.name: COLORS['green'],
@@ -562,21 +320,53 @@ class NeuroRenderCore:
             NeuronClass.OTHER.name: COLORS['orange'],
         }
 
-        # cached CPU arrays for QC if needed
         self._pos_cpu: Optional[np.ndarray] = None
         
-        # FBO for integer rendering
-        self._integer_fbo: Optional[Tuple[int, int, int]] = None
+        self._fbo_rgba: Optional[moderngl.Framebuffer] = None
+        self._fbo_depth: Optional[moderngl.Framebuffer] = None
+        self._fbo_integer: Optional[moderngl.Framebuffer] = None
+
+    def _ensure_fbo_rgba(self, width: int, height: int) -> moderngl.Framebuffer:
+        if self._fbo_rgba is None or self._fbo_rgba.size != (width, height):
+            if self._fbo_rgba:
+                self._fbo_rgba.release()
+            color = self.gl.texture((width, height), 4, dtype='f1')
+            depth = self.gl.depth_renderbuffer((width, height))
+            self._fbo_rgba = self.gl.framebuffer(color_attachments=[color], depth_attachment=depth)
+        return self._fbo_rgba
+
+    def _ensure_fbo_depth(self, width: int, height: int) -> moderngl.Framebuffer:
+        if self._fbo_depth is None or self._fbo_depth.size != (width, height):
+            if self._fbo_depth:
+                self._fbo_depth.release()
+            color = self.gl.texture((width, height), 1, dtype='f4')
+            depth = self.gl.depth_renderbuffer((width, height))
+            self._fbo_depth = self.gl.framebuffer(color_attachments=[color], depth_attachment=depth)
+        return self._fbo_depth
+
+    def _ensure_fbo_integer(self, width: int, height: int) -> moderngl.Framebuffer:
+        if self._fbo_integer is None or self._fbo_integer.size != (width, height):
+            if self._fbo_integer:
+                self._fbo_integer.release()
+            color = self.gl.texture((width, height), 1, dtype='u1')
+            depth = self.gl.depth_renderbuffer((width, height))
+            self._fbo_integer = self.gl.framebuffer(color_attachments=[color], depth_attachment=depth)
+        return self._fbo_integer
 
     # ------------------------- Data / geometry -------------------------
-    def load_swc(self, path: Path, *, segments: int = 18, radius_scale: float = 1.0, radius_adaptive_alpha: float = 0.0, radius_ref_percentile: float = 50.0) -> None:
+    def load_swc(self, path: Path, *, segments: int = 18, radius_scale: float = 1.0, 
+                 radius_adaptive_alpha: float = 0.0, radius_ref_percentile: float = 50.0) -> None:
         neuron = load_swc(Path(path), validate=True)
-        self.set_neuron(neuron, segments=segments, radius_scale=radius_scale, radius_adaptive_alpha=radius_adaptive_alpha, radius_ref_percentile=radius_ref_percentile)
+        self.set_neuron(neuron, segments=segments, radius_scale=radius_scale, 
+                       radius_adaptive_alpha=radius_adaptive_alpha, radius_ref_percentile=radius_ref_percentile)
 
-    def set_neuron(self, neuron, *, segments: int = 18, radius_scale: float = 1.0, radius_adaptive_alpha: float = 0.0, radius_ref_percentile: float = 50.0) -> None:
+    def set_neuron(self, neuron, *, segments: int = 18, radius_scale: float = 1.0,
+                   radius_adaptive_alpha: float = 0.0, radius_ref_percentile: float = 50.0) -> None:
         self.neuron = neuron
         renderer = MeshRenderer(neuron)
-        by_type = renderer.build_mesh_by_type(segments=segments, cap=True, radius_scale=radius_scale, radius_adaptive_alpha=radius_adaptive_alpha, radius_ref_percentile=radius_ref_percentile)
+        by_type = renderer.build_mesh_by_type(segments=segments, cap=True, radius_scale=radius_scale,
+                                              radius_adaptive_alpha=radius_adaptive_alpha, 
+                                              radius_ref_percentile=radius_ref_percentile)
 
         order = [
             NeuronClass.SOMA.name,
@@ -588,8 +378,10 @@ class NeuroRenderCore:
 
         self.draw_ranges.clear()
         positions = []
-        bmin = None; bmax = None
+        bmin = None
+        bmax = None
         start = 0
+        
         for cls in order:
             m = by_type.get(cls)
             if m is None:
@@ -610,19 +402,28 @@ class NeuroRenderCore:
         if not positions:
             raise RuntimeError("No mesh data generated from neuron!")
 
-        pos_all = np.concatenate(positions, axis=0)
+        pos_all = np.concatenate(positions, axis=0).astype(np.float32)
         self.vertex_count = int(pos_all.shape[0])
         self.bounds_min = bmin
         self.bounds_max = bmax
         self.center = 0.5 * (bmin + bmax)
         self.diag = float(np.linalg.norm(bmax - bmin))
 
-        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, self.vbo_pos)
-        buf_t = (gl.GLfloat * pos_all.size)
-        gl.glBufferData(gl.GL_ARRAY_BUFFER, pos_all.nbytes, buf_t.from_buffer(pos_all), gl.GL_STATIC_DRAW)
-        gl.glBindBuffer(gl.GL_ARRAY_BUFFER, 0)
+        if self.vbo:
+            self.vbo.release()
+        self.vbo = self.gl.buffer(pos_all.tobytes())
 
-        # cache for QC if you prefer sampling vertices instead of AABB corners
+        if self.vao_rgba:
+            self.vao_rgba.release()
+        if self.vao_depth:
+            self.vao_depth.release()
+        if self.vao_integer:
+            self.vao_integer.release()
+
+        self.vao_rgba = self.gl.vertex_array(self.prog_rgba, [(self.vbo, '3f', 'in_position')])
+        self.vao_depth = self.gl.vertex_array(self.prog_depth, [(self.vbo, '3f', 'in_position')])
+        self.vao_integer = self.gl.vertex_array(self.prog_integer, [(self.vbo, '3f', 'in_position')])
+
         self._pos_cpu = pos_all.copy()
 
     # ----------------------------- Camera -----------------------------
@@ -637,7 +438,8 @@ class NeuroRenderCore:
             self.camera.ortho_scale = margin * radius
             self.camera.eye = self.camera.target + np.array([0.0, 0.0, 3.0 * radius + 1.0], dtype=np.float32)
 
-    def set_projection(self, *, perspective: Optional[bool] = None, fovy: Optional[float] = None, ortho_scale: Optional[float] = None):
+    def set_projection(self, *, perspective: Optional[bool] = None, fovy: Optional[float] = None, 
+                       ortho_scale: Optional[float] = None):
         if perspective is not None:
             self.camera.perspective = bool(perspective)
         if fovy is not None:
@@ -678,7 +480,6 @@ class NeuroRenderCore:
         self.camera.target += delta
 
     def dolly(self, factor: float):
-        # factor < 1 zoom in, >1 zoom out
         view_dir = self.camera.target - self.camera.eye
         dist = np.linalg.norm(view_dir)
         if self.camera.perspective:
@@ -702,8 +503,8 @@ class NeuroRenderCore:
         return v
 
     # --------------------------- Projection ---------------------------
-    def _compute_projection(self) -> np.ndarray:
-        aspect = max(1e-6, self.aspect)
+    def _compute_projection(self, aspect: Optional[float] = None) -> np.ndarray:
+        aspect = aspect or max(1e-6, self.aspect)
         if self.camera.perspective:
             self.camera.near = 0.02
             dist = float(np.linalg.norm(self.camera.eye - self.camera.target))
@@ -717,370 +518,204 @@ class NeuroRenderCore:
             self.camera.far = max(self.camera.near + 1.0, dist + self.diag * 3.0)
             return orthographic(-half_w, half_w, -half_h, half_h, self.camera.near, self.camera.far)
 
+    def _compute_matrices(self, aspect: Optional[float] = None) -> Tuple[np.ndarray, np.ndarray]:
+        V = self.camera.view()
+        P = self._compute_projection(aspect)
+        M = np.eye(4, dtype=np.float32)
+        MVP = P @ V @ M
+        MV = V @ M
+        return MVP, MV
+
     # ------------------------------ Draw ------------------------------
-    def _setup_render_state(self, config: RenderConfig) -> Tuple[bool, bool, bool]:
-        """Setup GL state for rendering. Returns (srgb_was_enabled, blend_was_enabled, cull_was_enabled)."""
-        srgb_enabled = gl.glIsEnabled(gl.GL_FRAMEBUFFER_SRGB)
-        blend_enabled = gl.glIsEnabled(gl.GL_BLEND)
-        cull_enabled = gl.glIsEnabled(gl.GL_CULL_FACE)
-        
-        if config.disable_srgb and srgb_enabled:
-            gl.glDisable(gl.GL_FRAMEBUFFER_SRGB)
-        if config.disable_blend and blend_enabled:
-            gl.glDisable(gl.GL_BLEND)
-        if config.disable_cull and cull_enabled:
-            gl.glDisable(gl.GL_CULL_FACE)
-            
-        return srgb_enabled, blend_enabled, cull_enabled
-    
-    def _restore_render_state(self, srgb_enabled: bool, blend_enabled: bool, cull_enabled: bool):
-        """Restore GL state after rendering."""
-        if srgb_enabled:
-            gl.glEnable(gl.GL_FRAMEBUFFER_SRGB)
-        if blend_enabled:
-            gl.glEnable(gl.GL_BLEND)
-        if cull_enabled:
-            gl.glEnable(gl.GL_CULL_FACE)
-    
-    def _setup_uniforms_rgba(self, config: RenderConfig):
-        """Setup RGBA shader uniforms for rendering."""
-        V = self.camera.view()
-        P = self._compute_projection()
-        M = np.eye(4, dtype=np.float32)
-
-        gl.glUniformMatrix4fv(self.uni_model_rgba, 1, gl.GL_TRUE, _as_glmat(M))
-        gl.glUniformMatrix4fv(self.uni_view_rgba, 1, gl.GL_TRUE, _as_glmat(V))
-        gl.glUniformMatrix4fv(self.uni_proj_rgba, 1, gl.GL_TRUE, _as_glmat(P))
-        gl.glUniform1f(self.uni_depth_near_rgba, float(self.camera.near))
-        gl.glUniform1f(self.uni_depth_far_rgba, float(self.camera.far))
-        gl.glUniform1i(self.uni_render_mode_rgba, config.mode.value)
-
-    def _setup_uniforms_integer(self, config: RenderConfig):
-        """Setup integer shader uniforms for rendering."""
-        V = self.camera.view()
-        P = self._compute_projection()
-        M = np.eye(4, dtype=np.float32)
-
-        gl.glUniformMatrix4fv(self.uni_model_int, 1, gl.GL_TRUE, _as_glmat(M))
-        gl.glUniformMatrix4fv(self.uni_view_int, 1, gl.GL_TRUE, _as_glmat(V))
-        gl.glUniformMatrix4fv(self.uni_proj_int, 1, gl.GL_TRUE, _as_glmat(P))
-
-    def _setup_uniforms_depth(self):
-        """Setup depth shader uniforms for rendering."""
-        V = self.camera.view()
-        P = self._compute_projection()
-        M = np.eye(4, dtype=np.float32)
-
-        gl.glUniformMatrix4fv(self.uni_model_depth, 1, gl.GL_TRUE, _as_glmat(M))
-        gl.glUniformMatrix4fv(self.uni_view_depth, 1, gl.GL_TRUE, _as_glmat(V))
-        gl.glUniformMatrix4fv(self.uni_proj_depth, 1, gl.GL_TRUE, _as_glmat(P))
-        gl.glUniform1f(self.uni_depth_near_depth, float(self.camera.near))
-        gl.glUniform1f(self.uni_depth_far_depth, float(self.camera.far))
-
-    def render(self, config: RenderConfig) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
-        """Unified render method with different strategies."""
+    def render(self, config: RenderConfig) -> np.ndarray:
         if config.mode == RenderMode.CLASS_ID_INTEGER:
             return self._render_integer_ids(config)
         elif config.mode == RenderMode.DEPTH_TO_COLOR:
             return self._render_depth_to_color(config)
-        else:  # COLOR
+        else:
             return self._render_color(config)
 
     def _render_color(self, config: RenderConfig) -> np.ndarray:
-        """Render color image."""
-        gl.glViewport(0, 0, self.ctx.width, self.ctx.height)
-        gl.glClearColor(*config.background)
-        gl.glClear(gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT)
+        fbo = self._ensure_fbo_rgba(self.ctx.width, self.ctx.height)
+        fbo.use()
+        self.gl.clear(*config.background)
 
-        srgb_enabled, blend_enabled, cull_enabled = self._setup_render_state(config)
-        
-        gl.glBindVertexArray(self.vao)
-        gl.glUseProgram(self.program_rgba)
-        gl.glPolygonMode(gl.GL_FRONT_AND_BACK, gl.GL_FILL)
-        
-        self._setup_uniforms_rgba(config)
-        
+        if config.disable_cull:
+            self.gl.disable(moderngl.CULL_FACE)
+
+        MVP, MV = self._compute_matrices()
+        self.prog_rgba['u_mvp'].write(MVP.T.astype('f4').tobytes())
+        self.prog_rgba['u_mv'].write(MV.T.astype('f4').tobytes())
+        self.prog_rgba['u_depth_near'].value = float(self.camera.near)
+        self.prog_rgba['u_depth_far'].value = float(self.camera.far)
+        self.prog_rgba['u_render_mode'].value = 0
+
         if self.color_mode == 1:
             for dr in self.draw_ranges:
                 if not self.layer_visible.get(dr.cls, True):
                     continue
-                gl.glUniform3f(self.uni_color_rgba, float(dr.color[0]), float(dr.color[1]), float(dr.color[2]))
-                gl.glDrawArrays(gl.GL_TRIANGLES, dr.start, dr.count)
+                self.prog_rgba['u_color'].value = tuple(dr.color)
+                self.vao_rgba.render(moderngl.TRIANGLES, vertices=dr.count, first=dr.start)
         else:
-            gl.glUniform3f(self.uni_color_rgba, 0.82, 0.82, 0.90)
+            self.prog_rgba['u_color'].value = (0.82, 0.82, 0.90)
             for dr in self.draw_ranges:
                 if not self.layer_visible.get(dr.cls, True):
                     continue
-                gl.glDrawArrays(gl.GL_TRIANGLES, dr.start, dr.count)
+                self.vao_rgba.render(moderngl.TRIANGLES, vertices=dr.count, first=dr.start)
 
-        gl.glFinish()
-        
-        buffer = (gl.GLubyte * (self.ctx.width * self.ctx.height * 4))()
-        gl.glReadPixels(0, 0, self.ctx.width, self.ctx.height, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, buffer)
-        img = np.frombuffer(buffer, dtype=np.uint8).reshape(self.ctx.height, self.ctx.width, 4)
-        img = np.flipud(img)
-        
-        self._restore_render_state(srgb_enabled, blend_enabled, cull_enabled)
-        return img
+        if config.disable_cull:
+            self.gl.enable(moderngl.CULL_FACE)
+
+        data = fbo.color_attachments[0].read()
+        img = np.frombuffer(data, dtype=np.uint8).reshape(self.ctx.height, self.ctx.width, 4)
+        return np.flipud(img).copy()
 
     def _render_depth_to_color(self, config: RenderConfig) -> np.ndarray:
-        """Render depth as color."""
-        gl.glViewport(0, 0, self.ctx.width, self.ctx.height)
-        gl.glClearColor(*config.background)
-        gl.glClear(gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT)
+        fbo = self._ensure_fbo_rgba(self.ctx.width, self.ctx.height)
+        fbo.use()
+        self.gl.clear(*config.background)
 
-        srgb_enabled, blend_enabled, cull_enabled = self._setup_render_state(config)
-        
-        gl.glBindVertexArray(self.vao)
-        gl.glUseProgram(self.program_rgba)
-        gl.glPolygonMode(gl.GL_FRONT_AND_BACK, gl.GL_FILL)
-        
-        self._setup_uniforms_rgba(config)
+        if config.disable_cull:
+            self.gl.disable(moderngl.CULL_FACE)
+
+        MVP, MV = self._compute_matrices()
+        self.prog_rgba['u_mvp'].write(MVP.T.astype('f4').tobytes())
+        self.prog_rgba['u_mv'].write(MV.T.astype('f4').tobytes())
+        self.prog_rgba['u_depth_near'].value = float(self.camera.near)
+        self.prog_rgba['u_depth_far'].value = float(self.camera.far)
+        self.prog_rgba['u_render_mode'].value = 1
 
         for dr in self.draw_ranges:
             if not self.layer_visible.get(dr.cls, True):
                 continue
-            gl.glDrawArrays(gl.GL_TRIANGLES, dr.start, dr.count)
+            self.vao_rgba.render(moderngl.TRIANGLES, vertices=dr.count, first=dr.start)
 
-        gl.glFinish()
+        if config.disable_cull:
+            self.gl.enable(moderngl.CULL_FACE)
 
-        buffer = (gl.GLubyte * (self.ctx.width * self.ctx.height * 4))()
-        gl.glReadPixels(0, 0, self.ctx.width, self.ctx.height, gl.GL_RGBA, gl.GL_UNSIGNED_BYTE, buffer)
-        img = np.frombuffer(buffer, dtype=np.uint8).reshape(self.ctx.height, self.ctx.width, 4)
+        data = fbo.color_attachments[0].read()
+        img = np.frombuffer(data, dtype=np.uint8).reshape(self.ctx.height, self.ctx.width, 4)
         img = np.flipud(img)
-        depth01 = img[..., 0].astype(np.float32) / 255.0
-        
-        self._restore_render_state(srgb_enabled, blend_enabled, cull_enabled)
-        return depth01
+        return img[..., 0].astype(np.float32) / 255.0
 
     def _render_integer_ids(self, config: RenderConfig) -> np.ndarray:
-        """Render class IDs to integer FBO (single-sample)."""
-        if self._integer_fbo is None:
-            self._integer_fbo = self.ctx.create_integer_fbo()
-        
-        msaa_fbo, msaa_tex, msaa_depth = self._integer_fbo
-        
-        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, msaa_fbo)
-        gl.glViewport(0, 0, self.ctx.width, self.ctx.height)
-        
-        # Clear integer color buffer properly
-        clear_value = (gl.GLuint * 4)(0, 0, 0, 0)
-        gl.glClearBufferuiv(gl.GL_COLOR, 0, clear_value)
-        gl.glClear(gl.GL_DEPTH_BUFFER_BIT)
+        fbo = self._ensure_fbo_integer(self.ctx.width, self.ctx.height)
+        fbo.use()
+        fbo.clear(0.0, 0.0, 0.0, 0.0)
 
-        srgb_enabled, blend_enabled, cull_enabled = self._setup_render_state(config)
-        
-        gl.glBindVertexArray(self.vao)
-        gl.glUseProgram(self.program_integer)
-        gl.glPolygonMode(gl.GL_FRONT_AND_BACK, gl.GL_FILL)
-        
-        self._setup_uniforms_integer(config)
+        self.gl.disable(moderngl.CULL_FACE)
+
+        MVP, MV = self._compute_matrices()
+        self.prog_integer['u_mvp'].write(MVP.T.astype('f4').tobytes())
+        self.prog_integer['u_mv'].write(MV.T.astype('f4').tobytes())
 
         for dr in self.draw_ranges:
             if not self.layer_visible.get(dr.cls, True):
                 continue
             cid = int(config.class_to_id.get(dr.cls, 0))
             cid = max(0, min(255, cid))
-            gl.glUniform1i(self.uni_class_id_int, cid)
-            gl.glDrawArrays(gl.GL_TRIANGLES, dr.start, dr.count)
+            self.prog_integer['u_class_id'].value = cid
+            self.vao_integer.render(moderngl.TRIANGLES, vertices=dr.count, first=dr.start)
 
-        gl.glFinish()
-        
-        # Integer FBOs use single-sample for pixel-perfect IDs
-        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, msaa_fbo)
-        
-        # Read back integer IDs directly
-        buffer = (gl.GLubyte * (self.ctx.width * self.ctx.height))()
-        gl.glReadPixels(0, 0, self.ctx.width, self.ctx.height, gl.GL_RED_INTEGER, gl.GL_UNSIGNED_BYTE, buffer)
-        mask = np.frombuffer(buffer, dtype=np.uint8).reshape(self.ctx.height, self.ctx.width)
-        mask = np.flipud(mask)
-        
-        # Restore default framebuffer
-        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, 0)
-        
-        self._restore_render_state(srgb_enabled, blend_enabled, cull_enabled)
-        return mask
+        self.gl.enable(moderngl.CULL_FACE)
 
-    def render_rgba(self, *, background=(0.0, 0.0, 0.0, 0.0), also_return_depth=False, depth_factor: int = 2) -> Union[np.ndarray, tuple]:
-        """Render current scene to RGBA8 numpy array [H, W, 4].
-        If also_return_depth=True, returns (rgba, depth) as tuple.
-        
-        Args:
-            background: Background color as (R, G, B, A) tuple
-            also_return_depth: If True, also return depth map
-            depth_factor: Supersampling factor for depth (2, 3, or 4 recommended)
-        """
+        data = fbo.color_attachments[0].read()
+        mask = np.frombuffer(data, dtype=np.uint8).reshape(self.ctx.height, self.ctx.width)
+        return np.flipud(mask).copy()
+
+    def render_rgba(self, *, background=(0.0, 0.0, 0.0, 0.0), also_return_depth=False, 
+                    depth_factor: int = 2) -> Union[np.ndarray, tuple]:
+        """Render current scene to RGBA8 numpy array [H, W, 4]."""
         config = RenderConfig(mode=RenderMode.COLOR, background=background)
         rgba = self.render(config)
-        
+
         if also_return_depth:
             depth = self.render_depth(factor=depth_factor)
             return rgba, depth
         return rgba
-    
+
     def render_depth(self, *, factor: int = 2) -> np.ndarray:
-        """Render depth map to numpy array [H, W] in [0, 1] with supersampling using a dedicated depth shader.
-        Deterministic and independent of RGBA pipeline.
-        """
+        """Render depth map to numpy array [H, W] in [0, 1] with supersampling."""
         factor = int(max(1, factor))
         return self._render_depth_supersampled(factor)
 
     def _render_depth_supersampled(self, factor: int) -> np.ndarray:
-        """Render depth at (W*factor, H*factor) to a float texture, then average-pool down to (H, W)."""
         W, H = self.ctx.width, self.ctx.height
         Whi, Hhi = W * factor, H * factor
 
-        fbo = gl.GLuint()
-        gl.glGenFramebuffers(1, ctypes.byref(fbo))
-        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, fbo)
+        fbo = self._ensure_fbo_depth(Whi, Hhi)
+        fbo.use()
+        fbo.clear(0.0, 0.0, 0.0, 0.0)
 
-        color_tex = gl.GLuint()
-        gl.glGenTextures(1, ctypes.byref(color_tex))
-        gl.glBindTexture(gl.GL_TEXTURE_2D, color_tex)
-        # Single-channel 32-bit float for deterministic depth values
-        gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_R32F, Whi, Hhi, 0, gl.GL_RED, gl.GL_FLOAT, None)
-        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_NEAREST)
-        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_NEAREST)
-        gl.glFramebufferTexture2D(gl.GL_FRAMEBUFFER, gl.GL_COLOR_ATTACHMENT0, gl.GL_TEXTURE_2D, color_tex, 0)
-
-        depth_rbo = gl.GLuint()
-        gl.glGenRenderbuffers(1, ctypes.byref(depth_rbo))
-        gl.glBindRenderbuffer(gl.GL_RENDERBUFFER, depth_rbo)
-        gl.glRenderbufferStorage(gl.GL_RENDERBUFFER, gl.GL_DEPTH_COMPONENT24, Whi, Hhi)
-        gl.glFramebufferRenderbuffer(gl.GL_FRAMEBUFFER, gl.GL_DEPTH_ATTACHMENT, gl.GL_RENDERBUFFER, depth_rbo)
-
-        status = gl.glCheckFramebufferStatus(gl.GL_FRAMEBUFFER)
-        if status != gl.GL_FRAMEBUFFER_COMPLETE:
-            raise RuntimeError(f"Supersampled depth FBO incomplete: {status}")
-
-        gl.glViewport(0, 0, Whi, Hhi)
-        gl.glClearColor(0.0, 0.0, 0.0, 0.0)
-        gl.glClear(gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT)
+        self.gl.disable(moderngl.CULL_FACE)
 
         prev_aspect = self.aspect
         self.aspect = max(1e-6, Whi / float(Hhi))
+        MVP, MV = self._compute_matrices()
 
-        # Disable sRGB/blend/cull for depth pass
-        config = RenderConfig(mode=RenderMode.COLOR, background=(0.0, 0.0, 0.0, 0.0),
-                              disable_srgb=True, disable_blend=True, disable_cull=True)
-        srgb_enabled, blend_enabled, cull_enabled = self._setup_render_state(config)
-
-        gl.glBindVertexArray(self.vao)
-        gl.glUseProgram(self.program_depth)
-        gl.glPolygonMode(gl.GL_FRONT_AND_BACK, gl.GL_FILL)
-        self._setup_uniforms_depth()
+        self.prog_depth['u_mvp'].write(MVP.T.astype('f4').tobytes())
+        self.prog_depth['u_mv'].write(MV.T.astype('f4').tobytes())
+        self.prog_depth['u_depth_near'].value = float(self.camera.near)
+        self.prog_depth['u_depth_far'].value = float(self.camera.far)
 
         for dr in self.draw_ranges:
             if not self.layer_visible.get(dr.cls, True):
                 continue
-            gl.glDrawArrays(gl.GL_TRIANGLES, dr.start, dr.count)
+            self.vao_depth.render(moderngl.TRIANGLES, vertices=dr.count, first=dr.start)
 
-        gl.glFinish()
-
-        buf = (gl.GLfloat * (Whi * Hhi))()
-        gl.glReadPixels(0, 0, Whi, Hhi, gl.GL_RED, gl.GL_FLOAT, buf)
-        depth_hi = np.frombuffer(buf, dtype=np.float32).reshape(Hhi, Whi)
-        depth_hi = np.flipud(depth_hi)
-
-        gl.glViewport(0, 0, self.ctx.width, self.ctx.height)
-        self._restore_render_state(srgb_enabled, blend_enabled, cull_enabled)
+        self.gl.enable(moderngl.CULL_FACE)
         self.aspect = prev_aspect
 
-        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, 0)
-        gl.glDeleteFramebuffers(1, ctypes.byref(fbo))
-        gl.glDeleteTextures(1, ctypes.byref(color_tex))
-        gl.glDeleteRenderbuffers(1, ctypes.byref(depth_rbo))
+        data = fbo.color_attachments[0].read()
+        depth_hi = np.frombuffer(data, dtype=np.float32).reshape(Hhi, Whi)
+        depth_hi = np.flipud(depth_hi)
 
+        if factor == 1:
+            return depth_hi.copy()
         return average_pool_depth(depth_hi, factor, prefer_valid=True)
 
     def render_class_id_mask_msaa_safe(self, class_to_id: Dict[str, int]) -> np.ndarray:
-        """Render per-pixel class id mask using integer FBO with MSAA-safe resolve."""
+        """Render per-pixel class id mask."""
         config = RenderConfig(mode=RenderMode.CLASS_ID_INTEGER, background=(0.0, 0.0, 0.0, 0.0),
-                            class_to_id=class_to_id, disable_srgb=True, disable_blend=True, disable_cull=True)
+                              class_to_id=class_to_id)
         return self.render(config)
 
     def _render_integer_ids_supersampled(self, class_to_id: Dict[str, int], factor: int) -> np.ndarray:
-        """Render integer classes at (W*factor, H*factor) then majority-pool down to (H, W)."""
         W, H = self.ctx.width, self.ctx.height
         Whi, Hhi = W * factor, H * factor
 
-        fbo = gl.GLuint()
-        gl.glGenFramebuffers(1, ctypes.byref(fbo))
-        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, fbo)
+        fbo = self._ensure_fbo_integer(Whi, Hhi)
+        fbo.use()
+        fbo.clear(0.0, 0.0, 0.0, 0.0)
 
-        color_tex = gl.GLuint()
-        gl.glGenTextures(1, ctypes.byref(color_tex))
-        gl.glBindTexture(gl.GL_TEXTURE_2D, color_tex)
-        gl.glTexImage2D(gl.GL_TEXTURE_2D, 0, gl.GL_R8UI, Whi, Hhi, 0, gl.GL_RED_INTEGER, gl.GL_UNSIGNED_BYTE, None)
-        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_NEAREST)
-        gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_NEAREST)
-        gl.glFramebufferTexture2D(gl.GL_FRAMEBUFFER, gl.GL_COLOR_ATTACHMENT0, gl.GL_TEXTURE_2D, color_tex, 0)
-
-        depth_rbo = gl.GLuint()
-        gl.glGenRenderbuffers(1, ctypes.byref(depth_rbo))
-        gl.glBindRenderbuffer(gl.GL_RENDERBUFFER, depth_rbo)
-        gl.glRenderbufferStorage(gl.GL_RENDERBUFFER, gl.GL_DEPTH_COMPONENT24, Whi, Hhi)
-        gl.glFramebufferRenderbuffer(gl.GL_FRAMEBUFFER, gl.GL_DEPTH_ATTACHMENT, gl.GL_RENDERBUFFER, depth_rbo)
-
-        status = gl.glCheckFramebufferStatus(gl.GL_FRAMEBUFFER)
-        if status != gl.GL_FRAMEBUFFER_COMPLETE:
-            raise RuntimeError(f"Supersampled integer FBO incomplete: {status}")
-
-        gl.glViewport(0, 0, Whi, Hhi)
-
-        clear_value = (gl.GLuint * 4)(0, 0, 0, 0)
-        gl.glClearBufferuiv(gl.GL_COLOR, 0, clear_value)
-        gl.glClear(gl.GL_DEPTH_BUFFER_BIT)
+        self.gl.disable(moderngl.CULL_FACE)
 
         prev_aspect = self.aspect
         self.aspect = max(1e-6, Whi / float(Hhi))
+        MVP, MV = self._compute_matrices()
 
-        config = RenderConfig(mode=RenderMode.CLASS_ID_INTEGER, background=(0.0, 0.0, 0.0, 0.0),
-                            class_to_id=class_to_id, disable_srgb=True, disable_blend=True, disable_cull=True)
-        srgb_enabled, blend_enabled, cull_enabled = self._setup_render_state(config)
-
-        gl.glBindVertexArray(self.vao)
-        gl.glUseProgram(self.program_integer)
-        gl.glPolygonMode(gl.GL_FRONT_AND_BACK, gl.GL_FILL)
-        self._setup_uniforms_integer(config)
+        self.prog_integer['u_mvp'].write(MVP.T.astype('f4').tobytes())
+        self.prog_integer['u_mv'].write(MV.T.astype('f4').tobytes())
 
         for dr in self.draw_ranges:
             if not self.layer_visible.get(dr.cls, True):
                 continue
             cid = int(class_to_id.get(dr.cls, 0))
             cid = max(0, min(255, cid))
-            gl.glUniform1i(self.uni_class_id_int, cid)
-            gl.glDrawArrays(gl.GL_TRIANGLES, dr.start, dr.count)
+            self.prog_integer['u_class_id'].value = cid
+            self.vao_integer.render(moderngl.TRIANGLES, vertices=dr.count, first=dr.start)
 
-        gl.glFinish()
-
-        buf = (gl.GLubyte * (Whi * Hhi))()
-        gl.glReadPixels(0, 0, Whi, Hhi, gl.GL_RED_INTEGER, gl.GL_UNSIGNED_BYTE, buf)
-        mask_hi = np.frombuffer(buf, dtype=np.uint8).reshape(Hhi, Whi)
-        mask_hi = np.flipud(mask_hi)
-
-        gl.glViewport(0, 0, self.ctx.width, self.ctx.height)
-        self._restore_render_state(srgb_enabled, blend_enabled, cull_enabled)
+        self.gl.enable(moderngl.CULL_FACE)
         self.aspect = prev_aspect
 
-        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, 0)
-        gl.glDeleteFramebuffers(1, ctypes.byref(fbo))
-        gl.glDeleteTextures(1, ctypes.byref(color_tex))
-        gl.glDeleteRenderbuffers(1, ctypes.byref(depth_rbo))
+        data = fbo.color_attachments[0].read()
+        mask_hi = np.frombuffer(data, dtype=np.uint8).reshape(Hhi, Whi)
+        mask_hi = np.flipud(mask_hi)
 
         return majority_pool_uint8(mask_hi, factor, prefer_nonzero=True)
 
     def render_class_id_mask_supersampled(self, class_to_id: Dict[str, int], factor: int = 2) -> np.ndarray:
-        """Render class IDs with supersampling and majority-pool downsampling.
-        
-        Args:
-            class_to_id: Dictionary mapping class names to integer IDs
-            factor: Supersampling factor (2, 3, or 4 recommended). Must result in dimensions
-                   divisible by the factor. If factor=1, falls back to single-sample rendering.
-        
-        Returns:
-            uint8 array of shape (H, W) with class IDs
-        """
+        """Render class IDs with supersampling and majority-pool downsampling."""
         factor = int(max(1, factor))
         if factor == 1:
             return self.render_class_id_mask_msaa_safe(class_to_id)
@@ -1088,10 +723,7 @@ class NeuroRenderCore:
 
     # ------------------------------- QC -------------------------------
     def qc_fraction_in_frame(self) -> float:
-        """Fast QC estimate: fraction of AABB-derived points inside clip volume.
-        Uses 8 AABB corners + 8 axial midpoints. Optionally, you can use
-        self._pos_cpu for random vertex sampling if you prefer.
-        """
+        """Fast QC estimate: fraction of AABB-derived points inside clip volume."""
         if self.vertex_count == 0:
             return 0.0
         corners = _aabb_corners(self.bounds_min, self.bounds_max)
@@ -1135,10 +767,7 @@ def render_swc_to_image(
     color_by_type: bool = True,
     background: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0),
 ) -> Tuple[np.ndarray, float]:
-    """One-shot helper for headless pipelines.
-
-    Returns (rgba_uint8, qc_fraction).
-    """
+    """One-shot helper for headless pipelines. Returns (rgba_uint8, qc_fraction)."""
     with OffscreenContext(width, height, visible=False) as ctx:
         core = NeuroRenderCore(ctx)
         core.load_swc(Path(swc_path), segments=segments)
@@ -1150,7 +779,7 @@ def render_swc_to_image(
         qc = core.qc_fraction_in_frame()
         return img, qc
 
-# ================================ Demo =================================
+
 if __name__ == "__main__":
     import argparse
     from imageio.v2 import imwrite
