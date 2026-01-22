@@ -355,19 +355,57 @@ class NeuroRenderCore:
 
     # ------------------------- Data / geometry -------------------------
     def load_swc(self, path: Path, *, segments: int = 18, radius_scale: float = 1.0, 
-                 radius_adaptive_alpha: float = 0.0, radius_ref_percentile: float = 50.0) -> None:
-        neuron = load_swc(Path(path), validate=True)
-        self.set_neuron(neuron, segments=segments, radius_scale=radius_scale, 
-                       radius_adaptive_alpha=radius_adaptive_alpha, radius_ref_percentile=radius_ref_percentile)
+                 radius_adaptive_alpha: float = 0.0, radius_ref_percentile: float = 50.0,
+                 cache: bool = True, cache_dir: Optional[Path] = None) -> None:
+        """Load SWC file and build mesh.
+        
+        Args:
+            path: Path to SWC file
+            segments: Number of segments for tube mesh
+            radius_scale: Scale factor for radii
+            radius_adaptive_alpha: Adaptive scaling exponent
+            radius_ref_percentile: Reference percentile for adaptive scaling
+            cache: Enable mesh caching (default True). Cache stored in mesh_cache/ subdir.
+            cache_dir: Directory for cache files. If None, uses mesh_cache/ next to SWC.
+        """
+        path = Path(path)
+        neuron = load_swc(path, validate=True)
+        self.set_neuron(neuron, swc_path=path if cache else None, segments=segments, 
+                       radius_scale=radius_scale, radius_adaptive_alpha=radius_adaptive_alpha, 
+                       radius_ref_percentile=radius_ref_percentile, cache_dir=cache_dir)
 
-    def set_neuron(self, neuron, *, segments: int = 18, radius_scale: float = 1.0,
-                   radius_adaptive_alpha: float = 0.0, radius_ref_percentile: float = 50.0) -> None:
+    def set_neuron(self, neuron, *, swc_path: Optional[Path] = None, segments: int = 18, 
+                   radius_scale: float = 1.0, radius_adaptive_alpha: float = 0.0, 
+                   radius_ref_percentile: float = 50.0, cache_dir: Optional[Path] = None) -> None:
+        """Set neuron and build mesh, optionally using cache.
+        
+        Args:
+            neuron: Neuron object
+            swc_path: Path to SWC file (enables caching if provided)
+            cache_dir: Directory for cache files. If None, uses mesh_cache/ next to SWC.
+        """
         self.neuron = neuron
         renderer = MeshRenderer(neuron)
-        by_type = renderer.build_mesh_by_type(segments=segments, cap=True, radius_scale=radius_scale,
-                                              radius_adaptive_alpha=radius_adaptive_alpha, 
-                                              radius_ref_percentile=radius_ref_percentile)
+        
+        if swc_path is not None:
+            gpu_arrays = renderer.build_gpu_arrays_cached(
+                swc_path, segments=segments, cap=True, radius_scale=radius_scale,
+                radius_adaptive_alpha=radius_adaptive_alpha, 
+                radius_ref_percentile=radius_ref_percentile,
+                cache_dir=cache_dir
+            )
+            self._set_gpu_arrays(gpu_arrays)
+            return
+        
+        gpu_arrays = renderer.build_gpu_arrays(
+            segments=segments, cap=True, radius_scale=radius_scale,
+            radius_adaptive_alpha=radius_adaptive_alpha, 
+            radius_ref_percentile=radius_ref_percentile
+        )
+        self._set_gpu_arrays(gpu_arrays)
 
+    def _set_gpu_arrays(self, gpu_arrays: dict) -> None:
+        """Set geometry from pre-computed GPU-ready arrays."""
         order = [
             NeuronClass.SOMA.name,
             NeuronClass.AXON.name,
@@ -383,31 +421,27 @@ class NeuroRenderCore:
         start = 0
         
         for cls in order:
-            m = by_type.get(cls)
-            if m is None:
+            if cls not in gpu_arrays:
                 continue
-            v = np.asarray(m.vertices, dtype=np.float32)
-            f = np.asarray(m.faces, dtype=np.int32)
-            tri_count = f.shape[0]
-            pos = v[f.reshape(-1)]
+            pos = gpu_arrays[cls]
             positions.append(pos)
-            count = int(tri_count * 3)
+            count = pos.shape[0]
             self.draw_ranges.append(DrawRange(start, count, self._cls_colors[cls], cls))
             start += count
-            bm = m.bounds[0].astype(np.float32)
-            bM = m.bounds[1].astype(np.float32)
-            bmin = bm if bmin is None else np.minimum(bmin, bm)
-            bmax = bM if bmax is None else np.maximum(bmax, bM)
+            pmin = pos.min(axis=0)
+            pmax = pos.max(axis=0)
+            bmin = pmin if bmin is None else np.minimum(bmin, pmin)
+            bmax = pmax if bmax is None else np.maximum(bmax, pmax)
 
         if not positions:
-            raise RuntimeError("No mesh data generated from neuron!")
+            raise RuntimeError("No mesh data!")
 
         pos_all = np.concatenate(positions, axis=0).astype(np.float32)
         self.vertex_count = int(pos_all.shape[0])
-        self.bounds_min = bmin
-        self.bounds_max = bmax
-        self.center = 0.5 * (bmin + bmax)
-        self.diag = float(np.linalg.norm(bmax - bmin))
+        self.bounds_min = bmin.astype(np.float32)
+        self.bounds_max = bmax.astype(np.float32)
+        self.center = 0.5 * (self.bounds_min + self.bounds_max)
+        self.diag = float(np.linalg.norm(self.bounds_max - self.bounds_min))
 
         if self.vbo:
             self.vbo.release()
@@ -423,7 +457,6 @@ class NeuroRenderCore:
         self.vao_rgba = self.gl.vertex_array(self.prog_rgba, [(self.vbo, '3f', 'in_position')])
         self.vao_depth = self.gl.vertex_array(self.prog_depth, [(self.vbo, '3f', 'in_position')])
         self.vao_integer = self.gl.vertex_array(self.prog_integer, [(self.vbo, '3f', 'in_position')])
-
         self._pos_cpu = pos_all.copy()
 
     # ----------------------------- Camera -----------------------------

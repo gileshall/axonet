@@ -2,14 +2,74 @@
 3D mesh rendering for neuron morphology.
 """
 
+import hashlib
+from pathlib import Path
+from typing import Optional, Union
+
 import numpy as np
 import trimesh
-from typing import Optional, Union
-from pathlib import Path
+import matplotlib.cm as cm
+
 from ..core import Neuron
 from ..io import NeuronClass, classify_type_id
-import matplotlib.cm as cm
 from .sweep import sweep_circle
+
+
+# ========================= Mesh Cache System =========================
+
+MESH_CACHE_VERSION = 1
+
+def mesh_cache_key(swc_path: Path, segments: int, cap: bool, radius_scale: float,
+                   radius_adaptive_alpha: float, radius_ref_percentile: float) -> str:
+    """Generate cache key from SWC file stats and mesh parameters."""
+    stat = swc_path.stat()
+    key_parts = [
+        f"v{MESH_CACHE_VERSION}",
+        str(stat.st_mtime_ns),
+        str(stat.st_size),
+        str(segments),
+        str(int(cap)),
+        f"{radius_scale:.6f}",
+        f"{radius_adaptive_alpha:.6f}",
+        f"{radius_ref_percentile:.6f}",
+    ]
+    return hashlib.md5("|".join(key_parts).encode()).hexdigest()[:12]
+
+
+def default_cache_dir(swc_path: Path) -> Path:
+    """Default cache directory: mesh_cache/ subdirectory next to SWC file."""
+    return swc_path.parent / "mesh_cache"
+
+
+def cache_path_for_swc(swc_path: Path, cache_key: str, cache_dir: Optional[Path] = None) -> Path:
+    """Get cache file path for an SWC file."""
+    if cache_dir is None:
+        cache_dir = default_cache_dir(swc_path)
+    return cache_dir / f"{swc_path.stem}_{cache_key}.npz"
+
+
+def load_gpu_cache(cache_path: Path) -> Optional[dict[str, np.ndarray]]:
+    """Load GPU-ready arrays from npz cache."""
+    if not cache_path.exists():
+        return None
+    data = np.load(cache_path, allow_pickle=False)
+    return {k: data[k] for k in data.files}
+
+
+def save_gpu_cache(cache_path: Path, gpu_arrays: dict[str, np.ndarray]) -> None:
+    """Save GPU-ready arrays to npz cache."""
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(cache_path, **gpu_arrays)
+
+
+def clear_cache(directory: Path, *, recursive: bool = False) -> int:
+    """Remove mesh cache files from directory. Returns count removed."""
+    count = 0
+    search_fn = directory.rglob if recursive else directory.glob
+    for f in search_fn("*.npz"):
+        f.unlink()
+        count += 1
+    return count
 
 
 class MeshRenderer:
@@ -269,6 +329,51 @@ class MeshRenderer:
         if not out:
             raise ValueError("No meshes generated from SWC data")
         return out
+
+    def build_gpu_arrays(self, *, segments: int = 32, cap: bool = False, translate_to_origin: bool = True,
+                         radius_scale: float = 1.0, radius_adaptive_alpha: float = 0.0,
+                         radius_ref_percentile: float = 50.0) -> dict[str, np.ndarray]:
+        """Build GPU-ready expanded vertex arrays by neuron class.
+        
+        Returns dict mapping class name to (N, 3) float32 arrays ready for VBO upload.
+        """
+        meshes = self.build_mesh_by_type(
+            segments=segments, cap=cap, translate_to_origin=translate_to_origin,
+            radius_scale=radius_scale, radius_adaptive_alpha=radius_adaptive_alpha,
+            radius_ref_percentile=radius_ref_percentile
+        )
+        gpu_arrays = {}
+        for k, mesh in meshes.items():
+            v = np.asarray(mesh.vertices, dtype=np.float32)
+            f = np.asarray(mesh.faces, dtype=np.int32)
+            gpu_arrays[k] = v[f.reshape(-1)]
+        return gpu_arrays
+
+    def build_gpu_arrays_cached(self, swc_path: Path, *, segments: int = 32, cap: bool = False,
+                                 translate_to_origin: bool = True, radius_scale: float = 1.0,
+                                 radius_adaptive_alpha: float = 0.0, radius_ref_percentile: float = 50.0,
+                                 cache_dir: Optional[Path] = None) -> dict[str, np.ndarray]:
+        """Build GPU-ready arrays with disk caching (npz format).
+        
+        Args:
+            swc_path: Path to source SWC file (used for cache key)
+            cache_dir: Directory for cache files. If None, uses mesh_cache/ next to SWC.
+        """
+        cache_key = mesh_cache_key(swc_path, segments, cap, radius_scale,
+                                   radius_adaptive_alpha, radius_ref_percentile)
+        cache_file = cache_path_for_swc(swc_path, cache_key, cache_dir)
+
+        cached = load_gpu_cache(cache_file)
+        if cached is not None:
+            return cached
+
+        gpu_arrays = self.build_gpu_arrays(
+            segments=segments, cap=cap, translate_to_origin=translate_to_origin,
+            radius_scale=radius_scale, radius_adaptive_alpha=radius_adaptive_alpha,
+            radius_ref_percentile=radius_ref_percentile
+        )
+        save_gpu_cache(cache_file, gpu_arrays)
+        return gpu_arrays
 
     def build_scene(self, *, segments: int = 32, cap: bool = False, translate_to_origin: bool = True, glue_union: bool = False, colorize: bool = False, cmap: str = "viridis", radius_scale: float = 1.0, radius_adaptive_alpha: float = 0.0, radius_ref_percentile: float = 50.0) -> trimesh.Scene:
         parts = self.build_mesh_by_type(segments=segments, cap=cap, translate_to_origin=translate_to_origin, radius_scale=radius_scale, radius_adaptive_alpha=radius_adaptive_alpha, radius_ref_percentile=radius_ref_percentile)

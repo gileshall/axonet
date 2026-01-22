@@ -19,7 +19,7 @@ from imageio.v2 import imwrite
 from PIL import Image
 
 from ..io import load_swc, NeuronClass
-from ..models.d3_swc_vae import SegVAE2D
+from ..models.d3_swc_vae import SegVAE2D, load_model
 from ..visualization.render import OffscreenContext, NeuroRenderCore, RenderConfig, RenderMode
 
 logging.basicConfig(
@@ -322,7 +322,7 @@ def extract_embeddings(
     with torch.no_grad():
         input_batch = input_batch.to(device)
         logger.debug(f"Input tensor moved to {device}, shape: {input_batch.shape}")
-        z, mu, logvar, _, _ = model.encode(input_batch)
+        z, mu, logvar, e2, e1, e0 = model.encode(input_batch)
         logger.debug(f"Encoded shapes - z: {z.shape}, mu: {mu.shape}, logvar: {logvar.shape}")
         
         if reduce == "mean":
@@ -548,94 +548,6 @@ def evaluate_batch(
     logger.info(f"  Completed: {len(annotations)}/{n_total} files processed successfully")
     logger.info(f"  Total rendering: {total_cached_count} from cache, {total_rendered_count} newly rendered")
     return annotations
-
-
-def load_model(checkpoint_path: Path, device: str, **model_kwargs) -> SegVAE2D:
-    """Load trained model from checkpoint.
-    
-    Auto-detects model configuration from checkpoint state dict if not provided.
-    
-    Args:
-        checkpoint_path: Path to model checkpoint
-        device: Device string
-        **model_kwargs: Model initialization arguments (will be overridden by checkpoint if present)
-    
-    Returns:
-        Loaded SegVAE2D model
-    """
-    logger.info(f"Loading model from checkpoint: {checkpoint_path}")
-    logger.debug(f"Initial model kwargs: {model_kwargs}")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    logger.debug(f"Checkpoint keys: {list(checkpoint.keys()) if isinstance(checkpoint, dict) else 'state_dict'}")
-    
-    if "model_state_dict" in checkpoint:
-        state_dict = checkpoint["model_state_dict"]
-        logger.debug("Using 'model_state_dict' from checkpoint")
-    else:
-        state_dict = checkpoint
-        logger.debug("Using checkpoint directly as state_dict")
-    
-    # Auto-detect model configuration from state dict
-    has_depth = "head_depth.weight" in state_dict or "head_depth.bias" in state_dict
-    has_recon = "head_recon.weight" in state_dict or "head_recon.bias" in state_dict
-    
-    # Override model kwargs based on checkpoint (checkpoint is authoritative)
-    user_use_depth = model_kwargs.get("use_depth", False)
-    user_use_recon = model_kwargs.get("use_recon", False)
-    
-    logger.debug(f"Auto-detection: has_depth={has_depth}, has_recon={has_recon}")
-    
-    if has_depth:
-        model_kwargs["use_depth"] = True
-        if not user_use_depth:
-            logger.info("Auto-detected: use_depth=True (from checkpoint)")
-    elif user_use_depth:
-        logger.warning("use_depth=True requested but checkpoint doesn't have depth head. Disabling.")
-        model_kwargs["use_depth"] = False
-    
-    if has_recon:
-        model_kwargs["use_recon"] = True
-        if not user_use_recon:
-            logger.info("Auto-detected: use_recon=True (from checkpoint)")
-    elif user_use_recon:
-        logger.warning("use_recon=True requested but checkpoint doesn't have recon head. Disabling.")
-        model_kwargs["use_recon"] = False
-    
-    if "latent_channels" not in model_kwargs:
-        if "post_z.0.weight" in state_dict:
-            latent_channels = state_dict["post_z.0.weight"].shape[0]
-            model_kwargs["latent_channels"] = latent_channels
-            logger.debug(f"Auto-detected latent_channels={latent_channels}")
-    
-    if "num_classes" not in model_kwargs:
-        if "head_seg.weight" in state_dict:
-            num_classes = state_dict["head_seg.weight"].shape[0]
-            model_kwargs["num_classes"] = num_classes
-            logger.debug(f"Auto-detected num_classes={num_classes}")
-    
-    if "in_channels" not in model_kwargs:
-        if "enc0.block.0.weight" in state_dict:
-            in_channels = state_dict["enc0.block.0.weight"].shape[1]
-            model_kwargs["in_channels"] = in_channels
-            logger.debug(f"Auto-detected in_channels={in_channels}")
-    
-    logger.info(f"Model configuration: {model_kwargs}")
-    
-    logger.debug("Creating SegVAE2D model instance...")
-    model = SegVAE2D(**model_kwargs)
-    
-    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-    if missing_keys:
-        logger.warning(f"Missing keys in checkpoint: {missing_keys[:5]}... (total: {len(missing_keys)})")
-    if unexpected_keys:
-        logger.warning(f"Unexpected keys in checkpoint (ignored): {unexpected_keys[:5]}... (total: {len(unexpected_keys)})")
-    
-    logger.debug(f"Moving model to device: {device}")
-    model.to(device)
-    model.eval()
-    logger.info(f"Model loaded successfully on {device}")
-    
-    return model
 
 
 def render_thumbnail(

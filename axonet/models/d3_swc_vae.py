@@ -14,11 +14,15 @@
 
 from __future__ import annotations
 
+import logging
+from pathlib import Path
 from typing import Dict, Optional, Tuple, Literal
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+logger = logging.getLogger(__name__)
 
 
 # ----------------------------
@@ -509,6 +513,130 @@ def build_model(
         free_nats=free_nats,
         beta=beta,
     )
+
+
+def load_model(checkpoint_path: Path, device: str, embedding_only: bool = False, **model_kwargs) -> SegVAE2D:
+    """Load trained model from checkpoint.
+    
+    Auto-detects model configuration from checkpoint state dict if not provided.
+    Handles both PyTorch Lightning checkpoints (with 'state_dict' key and 'model.' prefix)
+    and direct state dict checkpoints.
+    
+    Args:
+        checkpoint_path: Path to model checkpoint
+        device: Device string
+        embedding_only: If True, skip loading decoder head weights (segmentation, depth, recon)
+                       for optimization when only extracting embeddings
+        **model_kwargs: Model initialization arguments (will be overridden by checkpoint if present)
+    
+    Returns:
+        Loaded SegVAE2D model
+    """
+    logger.info(f"Loading model from checkpoint: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+    if "state_dict" in checkpoint:
+        state_dict = checkpoint["state_dict"]
+        logger.debug("Using 'state_dict' from checkpoint")
+    elif "model_state_dict" in checkpoint:
+        state_dict = checkpoint["model_state_dict"]
+        logger.debug("Using 'model_state_dict' from checkpoint")
+    else:
+        state_dict = checkpoint
+        logger.debug("Using checkpoint directly as state_dict")
+    
+    if not state_dict:
+        raise ValueError(f"Checkpoint {checkpoint_path} contains no state_dict")
+    
+    if len(state_dict) == 0:
+        raise ValueError(f"Checkpoint {checkpoint_path} state_dict is empty")
+    
+    logger.debug(f"State dict has {len(state_dict)} keys, first few: {list(state_dict.keys())[:5]}")
+    
+    if any(key.startswith("model.") for key in state_dict.keys()):
+        logger.debug("Stripping 'model.' prefix from state dict keys")
+        state_dict = {key[6:] if key.startswith("model.") else key: value for key, value in state_dict.items()}
+    
+    if not any(key.startswith("enc0.") or key.startswith("head_") for key in state_dict.keys()):
+        raise ValueError(f"Checkpoint {checkpoint_path} does not contain valid model weights. "
+                        f"State dict keys: {list(state_dict.keys())[:10]}...")
+    
+    has_depth = "head_depth.weight" in state_dict or "head_depth.bias" in state_dict
+    has_recon = "head_recon.weight" in state_dict or "head_recon.bias" in state_dict
+    
+    user_use_depth = model_kwargs.get("use_depth", False)
+    user_use_recon = model_kwargs.get("use_recon", False)
+    
+    if has_depth:
+        model_kwargs["use_depth"] = True
+        if not user_use_depth:
+            logger.info("Auto-detected: use_depth=True (from checkpoint)")
+    elif user_use_depth:
+        logger.warning("use_depth=True requested but checkpoint doesn't have depth head. Disabling.")
+        model_kwargs["use_depth"] = False
+    
+    if has_recon:
+        model_kwargs["use_recon"] = True
+        if not user_use_recon:
+            logger.info("Auto-detected: use_recon=True (from checkpoint)")
+    elif user_use_recon:
+        logger.warning("use_recon=True requested but checkpoint doesn't have recon head. Disabling.")
+        model_kwargs["use_recon"] = False
+    
+    if "latent_channels" not in model_kwargs:
+        if "post_z.0.weight" in state_dict:
+            latent_channels = state_dict["post_z.0.weight"].shape[0]
+            model_kwargs["latent_channels"] = latent_channels
+    
+    if "num_classes" not in model_kwargs:
+        if "head_seg.weight" in state_dict:
+            num_classes = state_dict["head_seg.weight"].shape[0]
+            model_kwargs["num_classes"] = num_classes
+    
+    if "in_channels" not in model_kwargs:
+        if "enc0.block.0.weight" in state_dict:
+            in_channels = state_dict["enc0.block.0.weight"].shape[1]
+            model_kwargs["in_channels"] = in_channels
+    
+    if embedding_only:
+        logger.info("Embedding-only mode: skipping decoder head weights")
+        model_kwargs["use_depth"] = False
+        model_kwargs["use_recon"] = False
+        filtered_state_dict = {}
+        head_keys = ["head_seg", "head_depth", "head_recon"]
+        for key, value in state_dict.items():
+            if not any(key.startswith(head_prefix + ".") for head_prefix in head_keys):
+                filtered_state_dict[key] = value
+        state_dict = filtered_state_dict
+        logger.debug(f"Filtered state dict: {len(state_dict)} keys (removed head weights)")
+    
+    logger.info(f"Model configuration: {model_kwargs}")
+    
+    model = SegVAE2D(**model_kwargs)
+    
+    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+    if missing_keys:
+        if embedding_only:
+            missing_head_keys = [k for k in missing_keys if any(k.startswith(h) for h in ["head_seg", "head_depth", "head_recon"])]
+            if len(missing_head_keys) == len(missing_keys):
+                logger.debug(f"All missing keys are head weights (expected in embedding-only mode): {len(missing_keys)}")
+            else:
+                critical_missing = [k for k in missing_keys if k not in missing_head_keys]
+                logger.error(f"FATAL: Missing {len(critical_missing)} critical keys. First 10: {critical_missing[:10]}")
+                raise ValueError(f"Checkpoint {checkpoint_path} is missing critical model weights. "
+                                f"Missing keys: {critical_missing[:10]}... (total: {len(critical_missing)})")
+        else:
+            logger.error(f"FATAL: Missing {len(missing_keys)} keys in checkpoint. First 10: {missing_keys[:10]}")
+            raise ValueError(f"Checkpoint {checkpoint_path} is missing critical model weights. "
+                            f"Missing keys: {missing_keys[:10]}... (total: {len(missing_keys)})")
+    if unexpected_keys:
+        logger.warning(f"Unexpected keys in checkpoint (ignored): {unexpected_keys[:5]}... (total: {len(unexpected_keys)})")
+    
+    model.to(device)
+    model.eval()
+    logger.info(f"Model loaded successfully on {device}" + (" (embedding-only mode)" if embedding_only else ""))
+    
+    return model
 
 
 # ----------------------------

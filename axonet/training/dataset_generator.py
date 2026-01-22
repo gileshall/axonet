@@ -113,6 +113,8 @@ def render_with_masks(
     auto_margin: bool,
     seed: int | None,
     supersample_factor: int = 2,
+    cache: bool = True,
+    cache_dir: Path | None = None,
 ) -> Tuple[Path, List[dict]]:
     """Render image + segmentation mask pairs."""
     from ..io import NeuronClass
@@ -145,7 +147,11 @@ def render_with_masks(
 
     with OffscreenContext(width, height, visible=False, samples=0) as ctx:
         core = NeuroRenderCore(ctx)
-        core.load_swc(swc_path, segments=segments, radius_scale=radius_scale, radius_adaptive_alpha=radius_adaptive_alpha, radius_ref_percentile=radius_ref_percentile)
+        core.load_swc(
+            swc_path, segments=segments, radius_scale=radius_scale, 
+            radius_adaptive_alpha=radius_adaptive_alpha, radius_ref_percentile=radius_ref_percentile,
+            cache=cache, cache_dir=cache_dir
+        )
         core.set_projection(perspective=(projection == "perspective"), fovy=fovy)
         core.depth_shading = depth_shading
         core.color_mode = 1
@@ -312,6 +318,9 @@ def main():
     p.add_argument("--test-ratio", type=float, default=0.0, help="Test set ratio (0.0 = no test set, default: 0.0)")
     p.add_argument("--split-seed", type=int, default=42, help="Random seed for SWC file splitting")
     
+    p.add_argument("--no-cache", action="store_true", help="Disable mesh caching (caching enabled by default)")
+    p.add_argument("--cache-dir", type=Path, default=None, help="Directory for mesh cache (default: mesh_cache/ next to SWC files)")
+    
     args = p.parse_args()
 
     if args.val_ratio < 0 or args.val_ratio >= 1:
@@ -333,6 +342,12 @@ def main():
     
     print(f"Found {len(swc_files)} SWC files")
     print(f"Split: train={len(train_files)}, val={len(val_files)}, test={len(test_files)}")
+    cache_enabled = not args.no_cache
+    if cache_enabled:
+        cache_loc = args.cache_dir or "mesh_cache/ next to SWC files"
+        print(f"Mesh caching: enabled ({cache_loc})")
+    else:
+        print("Mesh caching: disabled")
     
     render_args = {
         "views": args.views,
@@ -353,6 +368,8 @@ def main():
         "radius_adaptive_alpha": args.radius_adaptive_alpha,
         "radius_ref_percentile": args.radius_ref_percentile,
         "supersample_factor": args.supersample_factor,
+        "cache": cache_enabled,
+        "cache_dir": args.cache_dir,
     }
 
     def process_split(split_name: str, swc_list: List[Path], manifest_path: Path):
