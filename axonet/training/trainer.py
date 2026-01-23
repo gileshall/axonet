@@ -4,13 +4,11 @@ from __future__ import annotations
 
 import argparse
 import json
-import random
 from pathlib import Path
 from typing import Dict, Optional
 
 import numpy as np
 import torch
-import torch.nn as nn
 from imageio.v2 import imread
 from pytorch_lightning import LightningDataModule, LightningModule, Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
@@ -22,8 +20,9 @@ from ..models.d3_swc_vae import SegVAE2D, MultiTaskLoss, build_model
 
 class NeuronDataset(Dataset):
     """Dataset for neuron binary mask (input) + segmentation mask pairs.
-    
+
     Uses mask_bw (black/white binary mask) as input, and mask (class IDs) as segmentation target.
+    Depth maps are automatically loaded if present in the manifest.
     """
 
     def __init__(
@@ -32,13 +31,6 @@ class NeuronDataset(Dataset):
         data_root: Path,
         *,
         transform=None,
-        load_depth: bool = False,
-        load_recon: bool = False,
-        use_inpaint: bool = False,
-        inpaint_mask_type: str = "rect",
-        inpaint_mask_ratio: float = 0.25,
-        inpaint_min_size: float = 0.1,
-        inpaint_max_size: float = 0.3,
     ):
         self.data_root = Path(data_root)
         self.manifest_entries = []
@@ -46,18 +38,11 @@ class NeuronDataset(Dataset):
             for line in f:
                 entry = json.loads(line.strip())
                 self.manifest_entries.append(entry)
-        
-        if not load_depth and len(self.manifest_entries) > 0 and "depth" in self.manifest_entries[0]:
-            load_depth = True
-        
+
+        # Auto-detect depth availability from manifest
+        self.load_depth = len(self.manifest_entries) > 0 and "depth" in self.manifest_entries[0]
+
         self.transform = transform
-        self.load_depth = load_depth
-        self.load_recon = load_recon
-        self.use_inpaint = use_inpaint and load_recon
-        self.inpaint_mask_type = inpaint_mask_type
-        self.inpaint_mask_ratio = inpaint_mask_ratio
-        self.inpaint_min_size = inpaint_min_size
-        self.inpaint_max_size = inpaint_max_size
 
     def __len__(self):
         return len(self.manifest_entries)
@@ -89,60 +74,17 @@ class NeuronDataset(Dataset):
             "input": input_tensor,
             "seg": mask_tensor,
         }
-        
+
         if self.load_depth:
             depth = self._load_depth(entry)
             if depth is not None:
                 sample["depth"] = depth
                 sample["valid_depth_mask"] = torch.ones_like(depth)
-        
-        if self.load_recon:
-            sample["recon"] = input_tensor.clone()
-            
-            if self.use_inpaint:
-                inpaint_mask = self._generate_inpaint_mask(input_tensor.shape[-2:])
-                sample["inpaint_mask"] = inpaint_mask
-        
+
         if self.transform:
             sample = self.transform(sample)
-        
+
         return sample
-    
-    def _generate_inpaint_mask(self, img_shape: tuple) -> torch.Tensor:
-        """Generate inpainting mask for reconstruction task.
-        
-        Returns mask where 1.0 = masked region (loss computed here), 0.0 = visible region (loss ignored).
-        """
-        h, w = img_shape
-        mask = torch.zeros(1, h, w, dtype=torch.float32)
-        
-        if self.inpaint_mask_type == "rect":
-            num_patches = random.randint(1, 3)
-            for _ in range(num_patches):
-                patch_h = int(h * random.uniform(self.inpaint_min_size, self.inpaint_max_size))
-                patch_w = int(w * random.uniform(self.inpaint_min_size, self.inpaint_max_size))
-                y = random.randint(0, max(1, h - patch_h))
-                x = random.randint(0, max(1, w - patch_w))
-                mask[:, y:y+patch_h, x:x+patch_w] = 1.0
-        elif self.inpaint_mask_type == "random":
-            num_pixels = int(h * w * self.inpaint_mask_ratio)
-            flat_mask = mask.flatten()
-            indices = torch.randperm(len(flat_mask))[:num_pixels]
-            flat_mask[indices] = 1.0
-            mask = flat_mask.reshape(1, h, w)
-        elif self.inpaint_mask_type == "center":
-            center_h, center_w = h // 2, w // 2
-            patch_h = int(h * random.uniform(self.inpaint_min_size, self.inpaint_max_size))
-            patch_w = int(w * random.uniform(self.inpaint_min_size, self.inpaint_max_size))
-            y = center_h - patch_h // 2
-            x = center_w - patch_w // 2
-            y = max(0, min(y, h - patch_h))
-            x = max(0, min(x, w - patch_w))
-            mask[:, y:y+patch_h, x:x+patch_w] = 1.0
-        else:
-            raise ValueError(f"Unknown mask type: {self.inpaint_mask_type}")
-        
-        return mask
 
     def _resolve_path(self, rel_path: str) -> Path:
         """Resolve a relative path from manifest, handling both with and without 'images/' prefix."""
@@ -182,15 +124,11 @@ def collate_fn(batch):
             batched["input"] = torch.stack([item["input"] for item in batch])
         elif key == "seg":
             batched["seg"] = torch.stack([item["seg"] for item in batch])
-        elif key == "recon":
-            batched["recon"] = torch.stack([item["recon"] for item in batch])
         elif key == "depth":
             batched["depth"] = torch.stack([item["depth"] for item in batch])
         elif key == "valid_depth_mask":
             batched["valid_depth_mask"] = torch.stack([item["valid_depth_mask"] for item in batch])
-        elif key == "inpaint_mask":
-            batched["inpaint_mask"] = torch.stack([item["inpaint_mask"] for item in batch])
-    
+
     return batched
 
 
@@ -204,15 +142,12 @@ class SegVAE2DLightning(LightningModule):
         num_classes: int = 4,
         latent_channels: int = 128,
         skip_latent_mult: float = 0.5,
-        use_depth: bool = False,
-        use_recon: bool = False,
         kld_weight: float = 0.1,
         skip_mode: str = "variational",
         free_nats: float = 0.0,
         beta: float = 1.0,
         lambda_seg: float = 1.0,
         lambda_depth: float = 1.0,
-        lambda_recon: float = 1.0,
         lr: float = 1e-4,
         weight_decay: float = 1e-5,
         lr_scheduler: str = "cosine",
@@ -221,25 +156,22 @@ class SegVAE2DLightning(LightningModule):
     ):
         super().__init__()
         self.save_hyperparameters()
-        
+
         self.model = build_model(
             in_channels=in_channels,
             base_channels=base_channels,
             num_classes=num_classes,
             latent_channels=latent_channels,
             skip_latent_mult=skip_latent_mult,
-            use_depth=use_depth,
-            use_recon=use_recon,
             kld_weight=kld_weight,
             skip_mode=skip_mode,
             free_nats=free_nats,
             beta=beta,
         )
-        
+
         self.criterion = MultiTaskLoss(
             lambda_seg=lambda_seg,
             lambda_depth=lambda_depth,
-            lambda_recon=lambda_recon,
         )
         
         self.lr = lr
@@ -344,13 +276,6 @@ class NeuronDataModule(LightningDataModule):
         manifest_test: Optional[Path] = None,
         batch_size: int = 8,
         num_workers: int = 4,
-        load_depth: bool = False,
-        load_recon: bool = False,
-        use_inpaint: bool = False,
-        inpaint_mask_type: str = "rect",
-        inpaint_mask_ratio: float = 0.25,
-        inpaint_min_size: float = 0.1,
-        inpaint_max_size: float = 0.3,
     ):
         super().__init__()
         self.data_dir = Path(data_dir)
@@ -359,46 +284,26 @@ class NeuronDataModule(LightningDataModule):
         self.manifest_test = Path(manifest_test) if manifest_test else None
         self.batch_size = batch_size
         self.num_workers = num_workers
-        self.load_depth = load_depth
-        self.load_recon = load_recon
-        self.use_inpaint = use_inpaint
-        self.inpaint_mask_type = inpaint_mask_type
-        self.inpaint_mask_ratio = inpaint_mask_ratio
-        self.inpaint_min_size = inpaint_min_size
-        self.inpaint_max_size = inpaint_max_size
 
     def setup(self, stage: str):
         if stage == "fit":
             self.train_dataset = NeuronDataset(
                 self.manifest_train,
                 self.data_dir,
-                load_depth=self.load_depth,
-                load_recon=self.load_recon,
-                use_inpaint=self.use_inpaint,
-                inpaint_mask_type=self.inpaint_mask_type,
-                inpaint_mask_ratio=self.inpaint_mask_ratio,
-                inpaint_min_size=self.inpaint_min_size,
-                inpaint_max_size=self.inpaint_max_size,
             )
             if self.manifest_val:
                 self.val_dataset = NeuronDataset(
                     self.manifest_val,
                     self.data_dir,
-                    load_depth=self.load_depth,
-                    load_recon=self.load_recon,
-                    use_inpaint=False,
                 )
             else:
                 self.val_dataset = None
-        
+
         if stage == "test":
             if self.manifest_test:
                 self.test_dataset = NeuronDataset(
                     self.manifest_test,
                     self.data_dir,
-                    load_depth=self.load_depth,
-                    load_recon=self.load_recon,
-                    use_inpaint=False,
                 )
             else:
                 self.test_dataset = None
@@ -459,18 +364,10 @@ def main():
     parser.add_argument("--skip-mode", type=str, default="variational", choices=["variational", "raw", "drop"], help="Skip connection mode: variational (stochastic), raw (identity), drop (zero)")
     parser.add_argument("--free-nats", type=float, default=0.0, help="Free-bits (nats) applied to KL terms (default: 0.0)")
     parser.add_argument("--beta", type=float, default=1.0, help="KL annealing multiplier for all KL terms (default: 1.0)")
-    parser.add_argument("--use-depth", action="store_true")
-    parser.add_argument("--use-recon", action="store_true")
-    parser.add_argument("--use-inpaint", action="store_true", help="Enable inpainting masks for reconstruction (only applies to training set)")
-    parser.add_argument("--inpaint-mask-type", type=str, default="rect", choices=["rect", "random", "center"], help="Type of inpainting mask: rect (random rectangles), random (random pixels), center (center rectangle)")
-    parser.add_argument("--inpaint-mask-ratio", type=float, default=0.25, help="Ratio of pixels to mask for 'random' mask type (default: 0.25)")
-    parser.add_argument("--inpaint-min-size", type=float, default=0.1, help="Minimum size of mask patches as fraction of image (default: 0.1)")
-    parser.add_argument("--inpaint-max-size", type=float, default=0.3, help="Maximum size of mask patches as fraction of image (default: 0.3)")
     parser.add_argument("--kld-weight", type=float, default=0.1, help="KL divergence weight (default: 0.1, lower due to variational skip connections)")
-    
+
     parser.add_argument("--lambda-seg", type=float, default=1.0)
     parser.add_argument("--lambda-depth", type=float, default=1.0)
-    parser.add_argument("--lambda-recon", type=float, default=1.0)
     
     parser.add_argument("--use-wandb", action="store_true", help="Enable Weights & Biases logging")
     parser.add_argument("--wandb-project", type=str, default="axonet-segvae2d", help="W&B project name")
@@ -498,30 +395,20 @@ def main():
         manifest_test=args.manifest_test,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        load_depth=args.use_depth,
-        load_recon=args.use_recon,
-        use_inpaint=args.use_inpaint,
-        inpaint_mask_type=args.inpaint_mask_type,
-        inpaint_mask_ratio=args.inpaint_mask_ratio,
-        inpaint_min_size=args.inpaint_min_size,
-        inpaint_max_size=args.inpaint_max_size,
     )
-    
+
     model = SegVAE2DLightning(
         in_channels=args.in_channels,
         base_channels=args.base_channels,
         num_classes=args.num_classes,
         latent_channels=args.latent_channels,
         skip_latent_mult=args.skip_latent_mult,
-        use_depth=args.use_depth,
-        use_recon=args.use_recon,
         kld_weight=args.kld_weight,
         skip_mode=args.skip_mode,
         free_nats=args.free_nats,
         beta=args.beta,
         lambda_seg=args.lambda_seg,
         lambda_depth=args.lambda_depth,
-        lambda_recon=args.lambda_recon,
         lr=args.lr,
         weight_decay=args.weight_decay,
         lr_scheduler=args.lr_scheduler,

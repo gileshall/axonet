@@ -638,8 +638,6 @@ def main():
     parser.add_argument("--base-channels", type=int, default=64, help="Model base channels")
     parser.add_argument("--num-classes", type=int, default=4, help="Number of segmentation classes")
     parser.add_argument("--latent-channels", type=int, default=128, help="Latent dimension")
-    parser.add_argument("--use-depth", action="store_true", help="Model uses depth head")
-    parser.add_argument("--use-recon", action="store_true", help="Model uses reconstruction head")
     parser.add_argument("--kld-weight", type=float, default=1.0, help="KLD weight")
     
     parser.add_argument("--embedding-only", action="store_true", default=True,
@@ -677,8 +675,6 @@ def main():
         base_channels=args.base_channels,
         num_classes=args.num_classes,
         latent_channels=args.latent_channels,
-        use_depth=args.use_depth,
-        use_recon=args.use_recon,
         kld_weight=args.kld_weight,
     )
     

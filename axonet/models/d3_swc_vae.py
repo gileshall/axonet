@@ -172,8 +172,6 @@ class SegVAE2D(nn.Module):
         num_classes:       segmentation classes.
         latent_channels:   channels at the global bottleneck.
         skip_latent_mult:  multiplicative factor vs skip width for per-skip latent size.
-        use_depth:         expose depth head.
-        use_recon:         expose reconstruction head.
         kld_weight:        global weight for KL.
         skip_mode:         'variational' | 'raw' | 'drop'.
         free_nats:         free-bits (nats) applied to KL terms (per mean reduction).
@@ -186,8 +184,6 @@ class SegVAE2D(nn.Module):
         num_classes: int = 4,
         latent_channels: int = 128,
         skip_latent_mult: float = 0.5,
-        use_depth: bool = True,
-        use_recon: bool = True,
         kld_weight: float = 0.1,
         skip_mode: Literal["variational", "raw", "drop"] = "variational",
         free_nats: float = 0.0,
@@ -197,8 +193,6 @@ class SegVAE2D(nn.Module):
 
         self.in_channels = in_channels
         self.num_classes = num_classes
-        self.use_depth = use_depth
-        self.use_recon = use_recon
         self.kld_weight = kld_weight
         self.skip_mode = skip_mode
         self.free_nats = free_nats
@@ -234,8 +228,7 @@ class SegVAE2D(nn.Module):
 
         # Heads
         self.head_seg = nn.Conv2d(ch1, num_classes, kernel_size=1)
-        self.head_depth = nn.Conv2d(ch1, 1, kernel_size=1) if use_depth else None
-        self.head_recon = nn.Conv2d(ch1, in_channels, kernel_size=1) if use_recon else None
+        self.head_depth = nn.Conv2d(ch1, 1, kernel_size=1)
 
         self._init_weights()
 
@@ -308,8 +301,7 @@ class SegVAE2D(nn.Module):
         Returns:
             {
               'seg_logits': (B, num_classes, H, W),
-              'depth':      (B,1,H,W)        [if use_depth],
-              'recon':      (B,C,H,W)        [if use_recon],
+              'depth':      (B,1,H,W),
               'kld':        scalar KL term (beta*(freebits(KL_b) + sum KL_skips))*kld_weight,
               + optional diagnostics if return_latent=True
             }
@@ -320,10 +312,7 @@ class SegVAE2D(nn.Module):
 
         seg_logits = self.head_seg(shared)
         out: Dict[str, torch.Tensor] = {"seg_logits": seg_logits}
-        if self.use_depth:
-            out["depth"] = self.head_depth(shared)
-        if self.use_recon:
-            out["recon"] = self.head_recon(shared)
+        out["depth"] = self.head_depth(shared)
 
         kld_b = self.kld(mu, logvar)
         kld_b = self._apply_freebits(kld_b)
@@ -354,12 +343,12 @@ class SegVAE2D(nn.Module):
 class MultiTaskLoss(nn.Module):
     """
     Compose the standard losses used for training.
-    
+
     Handles multiple KL divergence terms from variational skip connections.
     Automatically sums all KL terms (from 'kld' and 'kld_*' keys in outputs).
 
     Use:
-        criterion = MultiTaskLoss(lambda_seg=1.0, lambda_depth=1.0, lambda_recon=1.0)
+        criterion = MultiTaskLoss(lambda_seg=1.0, lambda_depth=1.0)
         outputs = model(x)
         loss, logs = criterion(outputs, targets)
     """
@@ -367,19 +356,15 @@ class MultiTaskLoss(nn.Module):
         self,
         lambda_seg: float = 1.0,
         lambda_depth: float = 1.0,
-        lambda_recon: float = 1.0,
         dice_smooth: float = 1.0,
         depth_huber_delta: float = 0.1,
-        recon_loss: str = "l1",
         ignore_index: int = -100
     ):
         super().__init__()
         self.lambda_seg = lambda_seg
         self.lambda_depth = lambda_depth
-        self.lambda_recon = lambda_recon
         self.dice_smooth = dice_smooth
         self.depth_huber_delta = depth_huber_delta
-        self.recon_loss = recon_loss
         self.ignore_index = ignore_index
 
     @staticmethod
@@ -413,9 +398,7 @@ class MultiTaskLoss(nn.Module):
             targets: dict with optional keys:
                 'seg'   → LongTensor (B,H,W)
                 'depth' → FloatTensor (B,1,H,W)
-                'recon' → FloatTensor (B,C,H,W) (ground truth / original image)
                 'valid_depth_mask' → optional (B,1,H,W) where 1 means supervised pixel
-                'inpaint_mask' → optional (B,1,H,W); if provided, only compute recon loss on masked regions.
 
         Returns:
             total_loss, logs (scalars)
@@ -451,32 +434,6 @@ class MultiTaskLoss(nn.Module):
             total = total + self.lambda_depth * depth_loss
             logs["depth"] = float(depth_loss.detach())
 
-        if "recon" in outputs and self.lambda_recon > 0:
-            pred = outputs["recon"]
-            target = targets.get("recon", None)
-            if target is None:
-                target = targets.get("input", None)
-                if target is None:
-                    raise ValueError("Reconstruction target missing: provide targets['recon'] or targets['input'].")
-
-            if "inpaint_mask" in targets:
-                mask = targets["inpaint_mask"].float()
-                pred = pred * mask
-                target = target * mask
-                denom = mask.sum().clamp_min(1.0)
-                reduction = "sum"
-            else:
-                denom = torch.tensor(pred.numel(), device=pred.device, dtype=pred.dtype)
-                reduction = "sum"
-
-            if self.recon_loss == "l2":
-                rec = F.mse_loss(pred, target, reduction=reduction) / denom
-            else:
-                rec = F.l1_loss(pred, target, reduction=reduction) / denom
-
-            total = total + self.lambda_recon * rec
-            logs["recon"] = float(rec.detach())
-
         return total, logs
 
 
@@ -490,8 +447,6 @@ def build_model(
     num_classes: int = 4,
     latent_channels: int = 128,
     skip_latent_mult: float = 0.5,
-    use_depth: bool = True,
-    use_recon: bool = True,
     kld_weight: float = 0.1,
     skip_mode: Literal["variational", "raw", "drop"] = "variational",
     free_nats: float = 0.0,
@@ -506,8 +461,6 @@ def build_model(
         num_classes=num_classes,
         latent_channels=latent_channels,
         skip_latent_mult=skip_latent_mult,
-        use_depth=use_depth,
-        use_recon=use_recon,
         kld_weight=kld_weight,
         skip_mode=skip_mode,
         free_nats=free_nats,
@@ -517,24 +470,24 @@ def build_model(
 
 def load_model(checkpoint_path: Path, device: str, embedding_only: bool = False, **model_kwargs) -> SegVAE2D:
     """Load trained model from checkpoint.
-    
+
     Auto-detects model configuration from checkpoint state dict if not provided.
     Handles both PyTorch Lightning checkpoints (with 'state_dict' key and 'model.' prefix)
     and direct state dict checkpoints.
-    
+
     Args:
         checkpoint_path: Path to model checkpoint
         device: Device string
-        embedding_only: If True, skip loading decoder head weights (segmentation, depth, recon)
+        embedding_only: If True, skip loading decoder head weights (segmentation, depth)
                        for optimization when only extracting embeddings
         **model_kwargs: Model initialization arguments (will be overridden by checkpoint if present)
-    
+
     Returns:
         Loaded SegVAE2D model
     """
     logger.info(f"Loading model from checkpoint: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    
+
     if "state_dict" in checkpoint:
         state_dict = checkpoint["state_dict"]
         logger.debug("Using 'state_dict' from checkpoint")
@@ -544,80 +497,61 @@ def load_model(checkpoint_path: Path, device: str, embedding_only: bool = False,
     else:
         state_dict = checkpoint
         logger.debug("Using checkpoint directly as state_dict")
-    
+
     if not state_dict:
         raise ValueError(f"Checkpoint {checkpoint_path} contains no state_dict")
-    
+
     if len(state_dict) == 0:
         raise ValueError(f"Checkpoint {checkpoint_path} state_dict is empty")
-    
+
     logger.debug(f"State dict has {len(state_dict)} keys, first few: {list(state_dict.keys())[:5]}")
-    
+
     if any(key.startswith("model.") for key in state_dict.keys()):
         logger.debug("Stripping 'model.' prefix from state dict keys")
         state_dict = {key[6:] if key.startswith("model.") else key: value for key, value in state_dict.items()}
-    
+
     if not any(key.startswith("enc0.") or key.startswith("head_") for key in state_dict.keys()):
         raise ValueError(f"Checkpoint {checkpoint_path} does not contain valid model weights. "
                         f"State dict keys: {list(state_dict.keys())[:10]}...")
-    
-    has_depth = "head_depth.weight" in state_dict or "head_depth.bias" in state_dict
-    has_recon = "head_recon.weight" in state_dict or "head_recon.bias" in state_dict
-    
-    user_use_depth = model_kwargs.get("use_depth", False)
-    user_use_recon = model_kwargs.get("use_recon", False)
-    
-    if has_depth:
-        model_kwargs["use_depth"] = True
-        if not user_use_depth:
-            logger.info("Auto-detected: use_depth=True (from checkpoint)")
-    elif user_use_depth:
-        logger.warning("use_depth=True requested but checkpoint doesn't have depth head. Disabling.")
-        model_kwargs["use_depth"] = False
-    
-    if has_recon:
-        model_kwargs["use_recon"] = True
-        if not user_use_recon:
-            logger.info("Auto-detected: use_recon=True (from checkpoint)")
-    elif user_use_recon:
-        logger.warning("use_recon=True requested but checkpoint doesn't have recon head. Disabling.")
-        model_kwargs["use_recon"] = False
-    
+
+    # Filter out legacy head_recon weights from old checkpoints
+    if "head_recon.weight" in state_dict or "head_recon.bias" in state_dict:
+        logger.info("Filtering out legacy head_recon weights from checkpoint")
+        state_dict = {k: v for k, v in state_dict.items() if not k.startswith("head_recon.")}
+
     if "latent_channels" not in model_kwargs:
         if "post_z.0.weight" in state_dict:
             latent_channels = state_dict["post_z.0.weight"].shape[0]
             model_kwargs["latent_channels"] = latent_channels
-    
+
     if "num_classes" not in model_kwargs:
         if "head_seg.weight" in state_dict:
             num_classes = state_dict["head_seg.weight"].shape[0]
             model_kwargs["num_classes"] = num_classes
-    
+
     if "in_channels" not in model_kwargs:
         if "enc0.block.0.weight" in state_dict:
             in_channels = state_dict["enc0.block.0.weight"].shape[1]
             model_kwargs["in_channels"] = in_channels
-    
+
     if embedding_only:
         logger.info("Embedding-only mode: skipping decoder head weights")
-        model_kwargs["use_depth"] = False
-        model_kwargs["use_recon"] = False
         filtered_state_dict = {}
-        head_keys = ["head_seg", "head_depth", "head_recon"]
+        head_keys = ["head_seg", "head_depth"]
         for key, value in state_dict.items():
             if not any(key.startswith(head_prefix + ".") for head_prefix in head_keys):
                 filtered_state_dict[key] = value
         state_dict = filtered_state_dict
         logger.debug(f"Filtered state dict: {len(state_dict)} keys (removed head weights)")
-    
+
     logger.info(f"Model configuration: {model_kwargs}")
-    
+
     model = SegVAE2D(**model_kwargs)
-    
+
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
     if missing_keys:
         if embedding_only:
-            missing_head_keys = [k for k in missing_keys if any(k.startswith(h) for h in ["head_seg", "head_depth", "head_recon"])]
+            missing_head_keys = [k for k in missing_keys if any(k.startswith(h) for h in ["head_seg", "head_depth"])]
             if len(missing_head_keys) == len(missing_keys):
                 logger.debug(f"All missing keys are head weights (expected in embedding-only mode): {len(missing_keys)}")
             else:
@@ -631,11 +565,11 @@ def load_model(checkpoint_path: Path, device: str, embedding_only: bool = False,
                             f"Missing keys: {missing_keys[:10]}... (total: {len(missing_keys)})")
     if unexpected_keys:
         logger.warning(f"Unexpected keys in checkpoint (ignored): {unexpected_keys[:5]}... (total: {len(unexpected_keys)})")
-    
+
     model.to(device)
     model.eval()
     logger.info(f"Model loaded successfully on {device}" + (" (embedding-only mode)" if embedding_only else ""))
-    
+
     return model
 
 
@@ -654,10 +588,7 @@ if __name__ == "__main__":
     out = model(x, return_latent=True)
 
     print("seg_logits:", tuple(out["seg_logits"].shape))
-    if "depth" in out:
-        print("depth:", tuple(out["depth"].shape))
-    if "recon" in out:
-        print("recon:", tuple(out["recon"].shape))
+    print("depth:", tuple(out["depth"].shape))
     print("kld:", float(out["kld"]))
     print("kld_bottleneck:", float(out.get("kld_bottleneck", torch.tensor(0.0))))
     print("kld_skips:", float(out.get("kld_skips", torch.tensor(0.0))))

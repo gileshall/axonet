@@ -22,8 +22,6 @@ model:
   latent_channels: 128
   num_classes: 6
   skip_mode: "variational"
-  use_depth: true
-  use_recon: true
 
 training:
   stage: 2

@@ -35,8 +35,6 @@ class ModelConfig:
     latent_channels: int = 128
     num_classes: int = 6
     skip_mode: Literal["variational", "raw", "drop"] = "variational"
-    use_depth: bool = True
-    use_recon: bool = True
 
 
 @dataclass
