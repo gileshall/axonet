@@ -1,0 +1,80 @@
+# Docker Compose for local development and testing
+version: '3.8'
+
+services:
+  # Development environment with all tools
+  dev:
+    build:
+      context: .
+      target: dev
+    volumes:
+      - .:/app
+      - ${HOME}/.config/gcloud:/root/.config/gcloud:ro
+      - axonet-data:/data
+    environment:
+      - GOOGLE_APPLICATION_CREDENTIALS=/root/.config/gcloud/application_default_credentials.json
+      - AXONET_LOCAL_DIR=/data/local
+    working_dir: /app
+    command: bash
+
+  # Dataset generation (local mode)
+  dataset-gen:
+    build:
+      context: .
+      target: dataset
+    volumes:
+      - ${DATA_DIR:-./data}:/data
+      - axonet-cache:/cache
+    environment:
+      - AXONET_LOCAL_DIR=/cache
+    command: >
+      --manifest /data/manifest.jsonl
+      --swc-prefix /data/swc
+      --output /data/output
+      --provider local
+
+  # Training (local mode, no GPU)
+  train-cpu:
+    build:
+      context: .
+      target: train
+    volumes:
+      - ${DATA_DIR:-./data}:/data
+      - ${CHECKPOINT_DIR:-./checkpoints}:/checkpoints
+    environment:
+      - AXONET_LOCAL_DIR=/tmp/axonet
+    command: >
+      --stage 1
+      --data-dir /data
+      --manifest manifest.jsonl
+      --output /checkpoints
+      --provider local
+
+  # Training (local mode, with GPU)
+  train-gpu:
+    build:
+      context: .
+      target: train
+    volumes:
+      - ${DATA_DIR:-./data}:/data
+      - ${CHECKPOINT_DIR:-./checkpoints}:/checkpoints
+    environment:
+      - AXONET_LOCAL_DIR=/tmp/axonet
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    command: >
+      --stage 1
+      --data-dir /data
+      --manifest manifest.jsonl
+      --output /checkpoints
+      --provider local
+      --precision bf16
+
+volumes:
+  axonet-data:
+  axonet-cache:

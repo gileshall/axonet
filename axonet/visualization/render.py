@@ -206,6 +206,18 @@ void main(){
 }
 """
 
+# Simpler vertex shader for integer rendering (no depth needed)
+VERT_SRC_SIMPLE = """
+#version 330 core
+in vec3 in_position;
+
+uniform mat4 u_mvp;
+
+void main(){
+    gl_Position = u_mvp * vec4(in_position, 1.0);
+}
+"""
+
 # ============================ Core types ============================
 
 class RenderMode(Enum):
@@ -255,9 +267,20 @@ class OffscreenContext:
         self.height = int(height)
         self.visible = bool(visible)
         self.samples = int(samples)
-        self.ctx = moderngl.create_standalone_context(require=330)
+        self.ctx = self._create_context()
         self.ctx.enable(moderngl.DEPTH_TEST)
         self.ctx.enable(moderngl.CULL_FACE)
+
+    def _create_context(self):
+        """Create OpenGL context, trying EGL first for headless environments."""
+        # Try EGL backend first (works in headless/container environments)
+        try:
+            return moderngl.create_standalone_context(require=330, backend='egl')
+        except Exception:
+            pass
+        
+        # Fall back to default backend (requires X11 display)
+        return moderngl.create_standalone_context(require=330)
 
     def close(self):
         if self.ctx:
@@ -280,7 +303,7 @@ class NeuroRenderCore:
 
         self.prog_rgba = self.gl.program(vertex_shader=VERT_SRC, fragment_shader=FRAG_SRC_RGBA)
         self.prog_depth = self.gl.program(vertex_shader=VERT_SRC, fragment_shader=FRAG_SRC_DEPTH)
-        self.prog_integer = self.gl.program(vertex_shader=VERT_SRC, fragment_shader=FRAG_SRC_INTEGER)
+        self.prog_integer = self.gl.program(vertex_shader=VERT_SRC_SIMPLE, fragment_shader=FRAG_SRC_INTEGER)
 
         self.vbo: Optional[moderngl.Buffer] = None
         self.vao_rgba: Optional[moderngl.VertexArray] = None
@@ -640,7 +663,6 @@ class NeuroRenderCore:
 
         MVP, MV = self._compute_matrices()
         self.prog_integer['u_mvp'].write(MVP.T.astype('f4').tobytes())
-        self.prog_integer['u_mv'].write(MV.T.astype('f4').tobytes())
 
         for dr in self.draw_ranges:
             if not self.layer_visible.get(dr.cls, True):
@@ -728,7 +750,6 @@ class NeuroRenderCore:
         MVP, MV = self._compute_matrices()
 
         self.prog_integer['u_mvp'].write(MVP.T.astype('f4').tobytes())
-        self.prog_integer['u_mv'].write(MV.T.astype('f4').tobytes())
 
         for dr in self.draw_ranges:
             if not self.layer_visible.get(dr.cls, True):

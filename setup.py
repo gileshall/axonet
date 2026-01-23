@@ -48,11 +48,20 @@ setup(
             "plotly>=5.0.0",
             "pyvista>=0.30.0",
         ],
+        "cloud": [
+            "google-cloud-storage",
+            "google-cloud-batch",
+            "google-cloud-compute",
+        ],
+        "clip": [
+            "sentence-transformers",
+        ],
     },
     entry_points={
         "console_scripts": [
             "axonet-analyze=axonet.cli:analyze",
             "axonet-visualize=axonet.cli:visualize",
+            "axonet-cloud=axonet.cloud.cli:main",
         ],
     },
 )

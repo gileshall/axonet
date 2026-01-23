@@ -9,3 +9,10 @@ matplotlib
 pyglet
 imageio
 pytorch-lightning
+torch
+torchvision
+pyyaml
+moderngl
+sentence-transformers
+litellm
+requests

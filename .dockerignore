@@ -1,0 +1,51 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+.eggs
+dist
+build
+*.egg
+
+# Virtual environments
+venv
+.venv
+env
+.env
+
+# IDE
+.idea
+.vscode
+*.swp
+*.swo
+.cursor
+
+# Data files (large)
+*.swc
+*.nrrd
+*.onnx
+*.onnx.data
+training/
+probing_results/
+
+# Notebooks
+notebooks/
+*.ipynb
+
+# Documentation
+docs/
+*.md
+!README.md
+
+# Test data
+tests/
+examples/data/
+
+# Local development
+.dockerignore.local
+docker-compose.override.yml

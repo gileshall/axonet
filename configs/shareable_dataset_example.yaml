@@ -1,0 +1,31 @@
+# Example: Shareable dataset configuration
+# Users can share this file to enable reproducible dataset curation
+dataset:
+  name: "mouse_visual_cortex_v1"
+  version: "1.0.0"
+  description: "Curated mouse visual cortex neurons from NeuroMorpho"
+
+sources:
+  - type: neuromorpho
+    query:
+      species: "mouse"
+      brain_region: "visual cortex"
+    # Optional: filter to specific neuron IDs
+    # include_ids: [10047, 10048, 10049]
+
+  # Additional source example (commented out)
+  # - type: allen
+  #   manifest_url: "https://example.com/allen_vcx_subset.csv"
+
+# Download instructions (for documentation)
+instructions:
+  download: |
+    1. Install axonet: pip install axonet
+    2. Run: python -m axonet.data.import_ --config shareable_dataset_example.yaml --output-dir ./data
+    3. This will fetch SWCs from NeuroMorpho API
+  
+  usage: |
+    from axonet.config import ExperimentConfig
+    config = ExperimentConfig.from_yaml("configs/stage1_neuromorpho.yaml")
+    # Update data.root to point to downloaded data
+    config.data.root = "./data"
