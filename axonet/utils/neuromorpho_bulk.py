@@ -13,11 +13,17 @@ Key features (mirrors the R code behavior you shared):
 - SSL verification can be disabled (--insecure) to work around expired certs.
 
 Examples:
-  # Metadata only
-  python neuromorpho_bulk.py --query 'species:mouse AND brain_region:"neocortex"' --out outdir --metadata-only --insecure
-
-  # Download standardized SWCs using the default URL pattern
+  # Simple query (single field)
   python neuromorpho_bulk.py --query 'species:mouse' --out outdir --insecure
+
+  # Complex query with multiple filters (POST method - use this for multi-field queries)
+  python neuromorpho_bulk.py --filters '{"domain": ["Dendrites, Soma, Axon"], "attributes": ["Diameter, 3D, Angles"]}' --out outdir --insecure
+
+  # Count only (prints just the number)
+  python neuromorpho_bulk.py --filters '{"domain": ["Dendrites, Soma, Axon"]}' --count-only --insecure
+
+  # Metadata with morphometry measurements
+  python neuromorpho_bulk.py --filters '{"species": ["mouse"]}' --out outdir --metadata-only --fetch-morphometry --insecure
 
   # Download standardized SWCs using per-neuron scraping (more stable)
   python neuromorpho_bulk.py --query 'species:mouse' --out outdir --find --insecure
@@ -124,6 +130,25 @@ def write_jsonl(path: str, records: Iterable[Dict[str, Any]]) -> None:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
+def fetch_morphometry(session: requests.Session, neuron_id: int, *, api_base: str, verify: bool, timeout: float) -> Optional[Dict[str, Any]]:
+    url = f"{api_base}/morphometry/id/{neuron_id}"
+    try:
+        return get_json(session, url, params={}, verify=verify, timeout=timeout)
+    except Exception:
+        return None
+
+
+def get_query_count(session: requests.Session, *, query: Optional[str], filters: Optional[Dict], api_base: str, verify: bool, timeout: float) -> int:
+    select_url = api_base + "/neuron/select"
+    params = {"page": 0, "size": 1}
+    if filters:
+        data = post_json(session, select_url, params=params, json_body=filters, verify=verify, timeout=timeout)
+    else:
+        params["q"] = query
+        data = get_json(session, select_url, params=params, verify=verify, timeout=timeout)
+    return data.get("page", {}).get("totalElements", 0)
+
+
 # --- SWC URL logic (pattern + scraping fallback) ---
 
 # Regex based on your R code approach: find an <a> that references dableFiles and contains
@@ -181,22 +206,59 @@ def build_standardized_swc_url_pattern(site_base: str, archive: str, neuron_name
 # --- Main paging loop ---
 
 def iter_pages(session: requests.Session, query: str, *, page_size: int, start_page: int,
-               max_pages: Optional[int], verify: bool, timeout: float) -> Iterable[Tuple[int, Dict[str, Any]]]:
+               max_pages: Optional[int], verify: bool, timeout: float, api_base: str) -> Iterable[Tuple[int, Dict[str, Any]]]:
     page = start_page
     yielded = 0
+    select_url = api_base + "/neuron/select"
     while True:
         if max_pages is not None and yielded >= max_pages:
             return
         params = {"q": query, "page": page, "size": page_size}
-        data = get_json(session, NEURON_SELECT, params=params, verify=verify, timeout=timeout)
+        data = get_json(session, select_url, params=params, verify=verify, timeout=timeout)
         yield page, data
 
         neurons = extract_neuron_list(data)
         if not neurons:
             return
 
-        # Many API pages expose totalPages; stop if present and we reached the end.
-        tp = data.get("totalPages")
+        tp = data.get("page", {}).get("totalPages")
+        if isinstance(tp, int) and page >= tp - 1:
+            return
+
+        page += 1
+        yielded += 1
+
+
+def post_json(session: requests.Session, url: str, *, params: Dict[str, Any], json_body: Dict[str, Any], verify: bool, timeout: float, retries: int = 6) -> Dict[str, Any]:
+    last = None
+    for a in range(retries):
+        try:
+            r = session.post(url, params=params, json=json_body, verify=verify, timeout=timeout)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last = e
+            backoff_sleep(a)
+    raise RuntimeError(f"POST JSON failed: {url} params={params} body={json_body} ({last})")
+
+
+def iter_pages_post(session: requests.Session, filters: Dict[str, List[str]], *, page_size: int, start_page: int,
+                    max_pages: Optional[int], verify: bool, timeout: float, api_base: str) -> Iterable[Tuple[int, Dict[str, Any]]]:
+    page = start_page
+    yielded = 0
+    select_url = api_base + "/neuron/select"
+    while True:
+        if max_pages is not None and yielded >= max_pages:
+            return
+        params = {"page": page, "size": page_size}
+        data = post_json(session, select_url, params=params, json_body=filters, verify=verify, timeout=timeout)
+        yield page, data
+
+        neurons = extract_neuron_list(data)
+        if not neurons:
+            return
+
+        tp = data.get("page", {}).get("totalPages")
         if isinstance(tp, int) and page >= tp - 1:
             return
 
@@ -206,14 +268,17 @@ def iter_pages(session: requests.Session, query: str, *, page_size: int, start_p
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--query", required=True, help='Search query, e.g. species:mouse AND brain_region:"neocortex"')
-    ap.add_argument("--out", required=True, help="Output folder")
-    ap.add_argument("--page-size", type=int, default=200, help="Max 500 :contentReference[oaicite:9]{index=9}")
+    ap.add_argument("--query", help='Simple search query, e.g. species:mouse (use --filters for complex queries)')
+    ap.add_argument("--filters", help='JSON filter dict for POST query, e.g. \'{"domain": ["Dendrites, Soma, Axon"], "attributes": ["Diameter, 3D, Angles"]}\'')
+    ap.add_argument("--out", help="Output folder")
+    ap.add_argument("--count-only", action="store_true", help="Print query count to stdout and exit")
+    ap.add_argument("--fetch-morphometry", action="store_true", help="Fetch and merge morphometry measurements for each neuron")
+    ap.add_argument("--page-size", type=int, default=200, help="Max 500")
     ap.add_argument("--start-page", type=int, default=0)
     ap.add_argument("--max-pages", type=int, default=None)
     ap.add_argument("--metadata-only", action="store_true")
-    ap.add_argument("--find", action="store_true", help="Scrape neuron_info.jsp to discover standardized SWC link (slower, more stable) :contentReference[oaicite:10]{index=10}")
-    ap.add_argument("--site", default=DEFAULT_SITE, help="Base site URL (default https://neuromorpho.org). You can set http://neuromorpho.org too.")
+    ap.add_argument("--find", action="store_true", help="Scrape neuron_info.jsp to discover standardized SWC link (slower, more stable)")
+    ap.add_argument("--site", default=DEFAULT_SITE, help="Base site URL (default https://neuromorpho.org)")
     ap.add_argument("--insecure", action="store_true", help="Disable SSL verification (verify=False)")
     ap.add_argument("--timeout", type=float, default=60.0)
     ap.add_argument("--overwrite", action="store_true")
@@ -223,9 +288,31 @@ def main() -> int:
         print("ERROR: --page-size must be between 1 and 500.", file=sys.stderr)
         return 2
 
+    if not args.query and not args.filters:
+        print("ERROR: either --query or --filters is required.", file=sys.stderr)
+        return 2
+
+    if not args.count_only and not args.out:
+        print("ERROR: --out is required unless using --count-only.", file=sys.stderr)
+        return 2
+
+    filters_dict = None
+    if args.filters:
+        filters_dict = json.loads(args.filters)
+
     verify = not args.insecure
     if args.insecure and urllib3 is not None:
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    api_base = args.site.rstrip("/") + "/api"
+
+    sess = requests.Session()
+    sess.headers.update({"User-Agent": "neuromorpho-bulk-requests/2.0 (requests-only)"})
+
+    if args.count_only:
+        count = get_query_count(sess, query=args.query, filters=filters_dict, api_base=api_base, verify=verify, timeout=args.timeout)
+        print(count)
+        return 0
 
     out_dir = args.out
     ensure_dir(out_dir)
@@ -234,30 +321,44 @@ def main() -> int:
     meta_path = os.path.join(out_dir, "metadata.jsonl")
     log_path = os.path.join(out_dir, "download_log.jsonl")
 
-    sess = requests.Session()
-    sess.headers.update({"User-Agent": "neuromorpho-bulk-requests/2.0 (requests-only)"})
-
-    # Override API base if site is overridden
-    global DEFAULT_API_BASE, NEURON_SELECT
-    DEFAULT_API_BASE = args.site.rstrip("/") + "/api"
-    NEURON_SELECT = DEFAULT_API_BASE + "/neuron/select"
-
     total_meta = 0
     total_swc = 0
     total_fail = 0
 
-    for page_idx, page_json in iter_pages(
-        sess, args.query,
-        page_size=args.page_size,
-        start_page=args.start_page,
-        max_pages=args.max_pages,
-        verify=verify,
-        timeout=args.timeout,
-    ):
+    if filters_dict:
+        page_iter = iter_pages_post(
+            sess, filters_dict,
+            page_size=args.page_size,
+            start_page=args.start_page,
+            max_pages=args.max_pages,
+            verify=verify,
+            timeout=args.timeout,
+            api_base=api_base,
+        )
+    else:
+        page_iter = iter_pages(
+            sess, args.query,
+            page_size=args.page_size,
+            start_page=args.start_page,
+            max_pages=args.max_pages,
+            verify=verify,
+            timeout=args.timeout,
+            api_base=api_base,
+        )
+
+    for page_idx, page_json in page_iter:
         neurons = extract_neuron_list(page_json)
         if not neurons:
             print(f"[page {page_idx}] No results; stopping.")
             break
+
+        if args.fetch_morphometry:
+            for neuron in neurons:
+                nid = neuron.get("neuron_id")
+                if nid:
+                    morph = fetch_morphometry(sess, nid, api_base=api_base, verify=verify, timeout=args.timeout)
+                    if morph:
+                        neuron["morphometry"] = morph
 
         write_jsonl(meta_path, neurons)
         total_meta += len(neurons)

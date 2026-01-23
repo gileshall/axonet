@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import List, Optional
 
@@ -28,11 +29,28 @@ def cmd_generate_dataset(args):
     provider = get_provider(args.provider)
     
     manifest_entries = []
-    with open(args.manifest) as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                manifest_entries.append(json.loads(line))
+    
+    if args.manifest:
+        # Load from provided manifest
+        with open(args.manifest) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    manifest_entries.append(json.loads(line))
+    else:
+        # Auto-discover SWC files from prefix
+        print(f"Discovering SWC files from {args.swc_prefix}...")
+        swc_files = provider.storage.list_files(args.swc_prefix)
+        swc_files = [f for f in swc_files if f.lower().endswith('.swc')]
+        print(f"Found {len(swc_files)} SWC files")
+        
+        for swc_path in swc_files:
+            filename = swc_path.rsplit('/', 1)[-1]
+            neuron_id = filename.rsplit('.', 1)[0]
+            manifest_entries.append({
+                "neuron_id": neuron_id,
+                "swc": filename,
+            })
     
     # Apply limit for smoke tests
     if args.limit and args.limit < len(manifest_entries):
@@ -40,26 +58,23 @@ def cmd_generate_dataset(args):
         print(f"Limited to {args.limit} neurons (smoke test)")
     
     total = len(manifest_entries)
+    if total == 0:
+        print("ERROR: No SWC files found")
+        sys.exit(1)
+    
     num_tasks = min(args.parallelism, total)
     
     print(f"Submitting dataset generation: {total} neurons, {num_tasks} tasks")
     
-    if args.upload_manifest:
-        remote_manifest = f"{args.output.rstrip('/')}/input/manifest.jsonl"
-        # If limited, write a temp manifest with only the limited entries
-        if args.limit:
-            import tempfile
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False) as f:
-                for entry in manifest_entries:
-                    f.write(json.dumps(entry) + "\n")
-                tmp_manifest = f.name
-            provider.storage.upload(Path(tmp_manifest), remote_manifest)
-            os.unlink(tmp_manifest)
-        else:
-            provider.storage.upload(Path(args.manifest), remote_manifest)
-        manifest_arg = remote_manifest
-    else:
-        manifest_arg = args.manifest
+    # Always upload manifest (auto-generated or provided)
+    remote_manifest = f"{args.output.rstrip('/')}/input/manifest.jsonl"
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False) as f:
+        for entry in manifest_entries:
+            f.write(json.dumps(entry) + "\n")
+        tmp_manifest = f.name
+    provider.storage.upload(Path(tmp_manifest), remote_manifest)
+    os.unlink(tmp_manifest)
+    manifest_arg = remote_manifest
     
     # Pass GCP environment variables to container
     env = _get_gcp_env()
@@ -74,12 +89,20 @@ def cmd_generate_dataset(args):
             "--width", str(args.width),
             "--height", str(args.height),
             "--views", str(args.views),
+            "--segments", str(args.segments),
+            "--supersample-factor", str(args.supersample_factor),
+            "--margin", str(args.margin),
+            "--projection", args.projection,
             "--task-index", str(i),
             "--total-tasks", str(num_tasks),
             "--provider", args.provider,
         ]
+        if args.auto_margin and not args.no_auto_margin:
+            cmd_args.append("--auto-margin")
         if args.no_cache:
             cmd_args.append("--no-cache")
+        if args.save_cache:
+            cmd_args.append("--save-cache")
         
         config = JobConfig(
             name=f"dataset-gen-{i}",
@@ -239,14 +262,20 @@ def main():
     subparsers = parser.add_subparsers(dest="command", required=True)
     
     gen_parser = subparsers.add_parser("generate-dataset", help="Generate training dataset")
-    gen_parser.add_argument("--manifest", required=True, help="Input manifest JSONL")
+    gen_parser.add_argument("--manifest", help="Input manifest JSONL (auto-discovers from swc-prefix if omitted)")
     gen_parser.add_argument("--swc-prefix", required=True, help="SWC files location")
     gen_parser.add_argument("--output", required=True, help="Output location (gs://...)")
-    gen_parser.add_argument("--upload-manifest", action="store_true", help="Upload manifest to cloud")
-    gen_parser.add_argument("--width", type=int, default=512)
-    gen_parser.add_argument("--height", type=int, default=512)
+    gen_parser.add_argument("--width", type=int, default=1024)
+    gen_parser.add_argument("--height", type=int, default=1024)
     gen_parser.add_argument("--views", type=int, default=24)
+    gen_parser.add_argument("--segments", type=int, default=32, help="Mesh segments per cylinder")
+    gen_parser.add_argument("--supersample-factor", type=int, default=4, help="Supersampling factor")
+    gen_parser.add_argument("--margin", type=float, default=0.40, help="Camera margin around neuron")
+    gen_parser.add_argument("--projection", choices=["ortho", "persp"], default="ortho")
+    gen_parser.add_argument("--auto-margin", action="store_true", default=True, help="Auto-expand margin if needed")
+    gen_parser.add_argument("--no-auto-margin", action="store_true", help="Disable auto-margin")
     gen_parser.add_argument("--no-cache", action="store_true")
+    gen_parser.add_argument("--save-cache", action="store_true", help="Upload mesh cache for later reuse")
     gen_parser.add_argument("--parallelism", type=int, default=10)
     gen_parser.add_argument("--limit", type=int, help="Limit neurons (smoke test)")
     gen_parser.add_argument("--image", default="gcr.io/PROJECT/axonet:latest")

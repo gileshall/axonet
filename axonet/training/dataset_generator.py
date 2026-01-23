@@ -295,8 +295,8 @@ def main():
     p.add_argument("--swc-dir", type=Path, required=True, help="Directory containing .swc files")
     p.add_argument("--out", type=Path, required=True, help="Output dataset directory")
     p.add_argument("--views", type=int, default=24, help="Number of viewpoints per SWC")
-    p.add_argument("--width", type=int, default=512)
-    p.add_argument("--height", type=int, default=512)
+    p.add_argument("--width", type=int, default=1024)
+    p.add_argument("--height", type=int, default=1024)
     p.add_argument("--segments", type=int, default=32, help="Cylinder segments")
     p.add_argument("--radius-scale", type=float, default=1.0, help="Global factor applied to neurite radii (soma unchanged)")
     p.add_argument("--radius-adaptive-alpha", type=float, default=0.0, help="If >0, adapt scaling stronger for thin neurites. 0 disables adaptive scaling")
@@ -334,7 +334,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "images").mkdir(exist_ok=True)
 
-    swc_files = sorted([p for p in Path(args.swc_dir).rglob("*.swc")])
+    swc_files = sorted([p for p in Path(args.swc_dir).rglob("*.swc", case_sensitive=False)])
     if not swc_files:
         raise SystemExit(f"No .swc files found under {args.swc_dir}")
 

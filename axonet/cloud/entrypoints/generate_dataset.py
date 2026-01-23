@@ -66,9 +66,14 @@ def download_inputs(
 def generate_renders(
     entries: List[dict],
     output_dir: Path,
-    width: int = 512,
-    height: int = 512,
+    width: int = 1024,
+    height: int = 1024,
     views: int = 24,
+    segments: int = 32,
+    supersample_factor: int = 4,
+    margin: float = 0.40,
+    projection: str = "ortho",
+    auto_margin: bool = True,
     cache: bool = True,
 ):
     """Generate rendered views for each neuron."""
@@ -94,21 +99,21 @@ def generate_renders(
             views=views,
             width=width,
             height=height,
-            segments=18,
+            segments=segments,
             radius_scale=1.0,
             radius_adaptive_alpha=0.0,
             radius_ref_percentile=50.0,
-            projection="ortho",
+            projection=projection,
             fovy=45.0,
-            margin=0.1,
+            margin=margin,
             depth_shading=True,
             background=(0.0, 0.0, 0.0, 1.0),
             min_qc=0.1,
             qc_retries=3,
             sampling="fibonacci",
-            auto_margin=True,
+            auto_margin=auto_margin,
             seed=None,
-            supersample_factor=2,
+            supersample_factor=supersample_factor,
             cache=cache,
             cache_dir=None,
         )
@@ -128,6 +133,8 @@ def upload_outputs(
     remote_prefix: str,
     manifest_entries: List[dict],
     task_index: int,
+    save_cache: bool = False,
+    swc_dir: Optional[Path] = None,
 ):
     """Upload generated outputs to remote storage."""
     for ext in ["*.png", "*.npz"]:
@@ -135,6 +142,15 @@ def upload_outputs(
             rel = f.relative_to(local_dir)
             remote = f"{remote_prefix.rstrip('/')}/{rel}"
             storage.upload(f, remote)
+    
+    # Upload mesh cache if requested
+    if save_cache and swc_dir:
+        cache_dir = swc_dir / "mesh_cache"
+        if cache_dir.exists():
+            logger.info(f"Uploading mesh cache from {cache_dir}")
+            for f in cache_dir.glob("*.npz"):
+                remote = f"{remote_prefix.rstrip('/')}/mesh_cache/{f.name}"
+                storage.upload(f, remote)
     
     manifest_path = local_dir / f"manifest_{task_index}.jsonl"
     with open(manifest_path, "w") as f:
@@ -149,10 +165,16 @@ def main():
     parser.add_argument("--manifest", required=True, help="Input manifest (local or gs://)")
     parser.add_argument("--swc-prefix", required=True, help="SWC files prefix (local or gs://)")
     parser.add_argument("--output", required=True, help="Output location (local or gs://)")
-    parser.add_argument("--width", type=int, default=512)
-    parser.add_argument("--height", type=int, default=512)
+    parser.add_argument("--width", type=int, default=1024)
+    parser.add_argument("--height", type=int, default=1024)
     parser.add_argument("--views", type=int, default=24)
+    parser.add_argument("--segments", type=int, default=32)
+    parser.add_argument("--supersample-factor", type=int, default=4)
+    parser.add_argument("--margin", type=float, default=0.40)
+    parser.add_argument("--projection", choices=["ortho", "persp"], default="ortho")
+    parser.add_argument("--auto-margin", action="store_true", default=True)
     parser.add_argument("--no-cache", action="store_true")
+    parser.add_argument("--save-cache", action="store_true", help="Upload mesh cache with outputs")
     parser.add_argument("--task-index", type=int, default=None, help="Task index (or BATCH_TASK_INDEX)")
     parser.add_argument("--total-tasks", type=int, default=1)
     parser.add_argument("--provider", default="local", choices=["local", "google"])
@@ -195,6 +217,7 @@ def main():
         logger.info("No entries to process for this task")
         return
     
+    swc_dir = local_dir / "swc"
     if storage and args.swc_prefix.startswith("gs://"):
         download_inputs(storage, args.manifest, args.swc_prefix, local_dir, task_entries)
     
@@ -205,13 +228,21 @@ def main():
         width=args.width,
         height=args.height,
         views=args.views,
+        segments=args.segments,
+        supersample_factor=args.supersample_factor,
+        margin=args.margin,
+        projection=args.projection,
+        auto_margin=args.auto_margin,
         cache=not args.no_cache,
     )
     
     logger.info(f"Generated {len(manifest_entries)} render entries")
     
     if storage and args.output.startswith("gs://"):
-        upload_outputs(storage, output_dir, args.output, manifest_entries, task_index)
+        upload_outputs(
+            storage, output_dir, args.output, manifest_entries, task_index,
+            save_cache=args.save_cache, swc_dir=swc_dir,
+        )
     else:
         out_manifest = Path(args.output) / f"manifest_{task_index}.jsonl"
         out_manifest.parent.mkdir(parents=True, exist_ok=True)
