@@ -1,0 +1,46 @@
+# Stage 1: Pre-train VAE on NeuroMorpho bulk data
+experiment:
+  name: "stage1_neuromorpho_pretrain"
+  description: "Pre-train SegVAE2D on NeuroMorpho bulk data"
+
+data:
+  source: "neuromorpho"
+  root: "/data/neuromorpho_out"
+  manifest: "train.jsonl"
+  metadata: "metadata.jsonl"
+  id_column: "neuron_id"
+
+rendering:
+  width: 512
+  height: 512
+  views_per_neuron: 24
+  projection: "ortho"
+  cache_dir: null
+
+model:
+  base_channels: 64
+  latent_channels: 128
+  num_classes: 6
+  skip_mode: "variational"
+  use_depth: true
+  use_recon: true
+
+training:
+  stage: 1
+  batch_size: 8
+  lr: 1.0e-4
+  max_epochs: 100
+  kld_weight: 0.1
+  beta: 1.0
+  free_nats: 0.0
+  gradient_clip_val: 1.0
+  precision: "32"
+  num_workers: 4
+  clip:
+    enabled: false
+
+output:
+  save_dir: "checkpoints/stage1_neuromorpho"
+  log_dir: "logs/stage1_neuromorpho"
+  save_top_k: 3
+  monitor: "val_loss"
