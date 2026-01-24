@@ -264,6 +264,16 @@ class SegVAE2D(nn.Module):
                 nn.init.constant_(m.weight, 1.0)
                 nn.init.constant_(m.bias, 0.0)
 
+        # Initialize logvar layers to output ~0 (variance ~1) at start
+        # This prevents KLD explosion from huge exp(logvar) terms
+        nn.init.zeros_(self.logvar.weight)
+        nn.init.constant_(self.logvar.bias, -2.0)  # Start with small variance
+
+        # Same for variational skip logvar layers
+        for vskip in [self.vskip0, self.vskip1, self.vskip2]:
+            nn.init.zeros_(vskip.logvar.weight)
+            nn.init.constant_(vskip.logvar.bias, -2.0)
+
     # ---- forward ----
     def encode(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         e0 = self.enc0(x)
