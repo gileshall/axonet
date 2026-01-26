@@ -21,7 +21,7 @@ import numpy as np
 from imageio.v2 import imwrite
 
 from ..visualization.render import OffscreenContext, NeuroRenderCore, COLORS
-from .sampling import fibonacci_sphere, random_sphere
+from .sampling import fibonacci_sphere, random_sphere, pca_guided_sampling, compute_projected_extent, compute_neuron_pca
 
 
 def place_camera_on_sphere(core: NeuroRenderCore, direction: np.ndarray, *, distance: float | None = None) -> None:
@@ -115,6 +115,10 @@ def render_with_masks(
     supersample_factor: int = 2,
     cache: bool = True,
     cache_dir: Path | None = None,
+    adaptive_framing: bool = False,
+    canonical_views: int = 6,
+    biased_views: int = 12,
+    random_views: int = 6,
 ) -> Tuple[Path, List[dict]]:
     """Render image + segmentation mask pairs."""
     from ..io import NeuronClass
@@ -160,12 +164,29 @@ def render_with_masks(
         target = core.camera.target.copy()
         dist = float(np.linalg.norm(core.camera.eye - target))
 
-        if sampling == "fibonacci":
+        # Extract node positions for PCA and adaptive framing
+        node_positions = np.array([n.position for n in core.neuron.nodes.values()], dtype=np.float64)
+
+        pca_eigenvalues = None
+        if sampling == "pca":
+            dirs, tiers = pca_guided_sampling(
+                node_positions,
+                n_canonical=canonical_views,
+                n_biased=biased_views,
+                n_random=random_views,
+                rng=rng,
+            )
+            views = len(dirs)
+            if len(node_positions) >= 10:
+                _, pca_eigenvalues, _ = compute_neuron_pca(node_positions)
+        elif sampling == "fibonacci":
             dirs = fibonacci_sphere(views, jitter=0.0, rng=rng)
+            tiers = ["fibonacci"] * views
         elif sampling == "random":
             dirs = random_sphere(views, rng=rng)
+            tiers = ["random"] * views
         else:
-            raise ValueError("sampling must be 'fibonacci' or 'random'")
+            raise ValueError("sampling must be 'pca', 'fibonacci', or 'random'")
 
         for i in range(views):
             base_dir = dirs[i]
@@ -184,6 +205,13 @@ def render_with_masks(
                 sampler=cand_dirs,
                 auto_margin=auto_margin,
             )
+
+            # Adaptive framing: tighten ortho_scale per view based on projected extent
+            if adaptive_framing and not core.camera.perspective:
+                proj_extent = compute_projected_extent(node_positions, used_dir)
+                diag = core.diag
+                clamped_extent = max(proj_extent, 0.15 * diag)
+                core.camera.ortho_scale = margin * 0.5 * clamped_extent
 
             depth = core.render_depth(factor=supersample_factor)
             
@@ -253,6 +281,8 @@ def render_with_masks(
                 "mask_bw": str(mask_bw_path.relative_to(root_dir)),
                 "idx": i,
                 "qc_fraction": float(qc),
+                "view_tier": tiers[i],
+                "occupancy_fraction": float(np.count_nonzero(mask) / mask.size),
                 "projection": "perspective" if core.camera.perspective else "ortho",
                 "camera": {
                     "eye": [float(x) for x in core.camera.eye],
@@ -267,6 +297,9 @@ def render_with_masks(
                     "mapping": CLASS_MAP,
                 },
             }
+            if pca_eigenvalues is not None and i == 0:
+                entry["pca_eigenvalues"] = [float(ev) for ev in pca_eigenvalues]
+                entry["aspect_ratio"] = float(pca_eigenvalues[0] / max(pca_eigenvalues[2], 1e-12))
             manifest_entries.append(entry)
 
     return (swc_path, manifest_entries)
@@ -308,8 +341,13 @@ def main():
     p.add_argument("--bg", type=float, nargs=4, default=(0, 0, 0, 1), metavar=("R", "G", "B", "A"))
     p.add_argument("--min-qc", type=float, default=0.7)
     p.add_argument("--qc-retries", type=int, default=5)
-    p.add_argument("--sampling", choices=["fibonacci", "random"], default="fibonacci")
+    p.add_argument("--sampling", choices=["pca", "fibonacci", "random"], default="pca")
     p.add_argument("--auto-margin", action="store_true")
+    p.add_argument("--adaptive-framing", action="store_true", default=False,
+                   help="Per-view adaptive ortho_scale based on projected extent")
+    p.add_argument("--canonical-views", type=int, default=6, help="PCA canonical views (+/-PC1,PC2,PC3)")
+    p.add_argument("--biased-views", type=int, default=12, help="PCA biased views near PC1-PC2 plane")
+    p.add_argument("--random-views", type=int, default=6, help="Random views for diversity")
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--supersample-factor", type=int, default=2, help="Supersampling factor for depth and mask rendering (2, 3, or 4 recommended)")
     p.add_argument("-j", "--jobs", type=int, default=1, help="Number of parallel jobs (1 = sequential)")
@@ -349,8 +387,17 @@ def main():
     else:
         print("Mesh caching: disabled")
     
+    # When using PCA sampling, total views = canonical + biased + random
+    if args.sampling == "pca":
+        effective_views = args.canonical_views + args.biased_views + args.random_views
+        print(f"PCA sampling: {args.canonical_views} canonical + {args.biased_views} biased + {args.random_views} random = {effective_views} views")
+        if args.adaptive_framing:
+            print("Adaptive framing: enabled")
+    else:
+        effective_views = args.views
+
     render_args = {
-        "views": args.views,
+        "views": effective_views,
         "width": args.width,
         "height": args.height,
         "segments": args.segments,
@@ -370,6 +417,10 @@ def main():
         "supersample_factor": args.supersample_factor,
         "cache": cache_enabled,
         "cache_dir": args.cache_dir,
+        "adaptive_framing": args.adaptive_framing,
+        "canonical_views": args.canonical_views,
+        "biased_views": args.biased_views,
+        "random_views": args.random_views,
     }
 
     def process_split(split_name: str, swc_list: List[Path], manifest_path: Path):
@@ -383,7 +434,7 @@ def main():
         
         if args.jobs > 1:
             print(f"Rendering with {args.jobs} parallel workers...")
-            print(f"Expected ~{len(swc_list) * args.views} total samples\n")
+            print(f"Expected ~{len(swc_list) * effective_views} total samples\n")
             
             with multiprocessing.Pool(args.jobs) as pool:
                 tasks = [(swc, out_dir / "images", {**render_args, "root_dir": out_dir}) for swc in swc_list]
@@ -401,7 +452,7 @@ def main():
                                       f"  {swc_path.name} ({len(manifest_entries)} views): ")
         else:
             print(f"Rendering sequentially...")
-            print(f"Expected ~{len(swc_list) * args.views} total samples\n")
+            print(f"Expected ~{len(swc_list) * effective_views} total samples\n")
             
             with open(manifest_path, "w", encoding="utf-8") as fout:
                 for idx, swc in enumerate(swc_list):

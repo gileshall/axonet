@@ -75,6 +75,8 @@ def generate_renders(
     projection: str = "ortho",
     auto_margin: bool = True,
     cache: bool = True,
+    sampling: str = "pca",
+    adaptive_framing: bool = True,
 ):
     """Generate rendered views for each neuron."""
     from axonet.training.dataset_generator import render_with_masks
@@ -110,12 +112,13 @@ def generate_renders(
             background=(0.0, 0.0, 0.0, 1.0),
             min_qc=0.1,
             qc_retries=3,
-            sampling="fibonacci",
+            sampling=sampling,
             auto_margin=auto_margin,
             seed=None,
             supersample_factor=supersample_factor,
             cache=cache,
             cache_dir=None,
+            adaptive_framing=adaptive_framing,
         )
         
         for re in render_entries:
@@ -173,6 +176,9 @@ def main():
     parser.add_argument("--margin", type=float, default=0.40)
     parser.add_argument("--projection", choices=["ortho", "persp"], default="ortho")
     parser.add_argument("--auto-margin", action="store_true", default=True)
+    parser.add_argument("--sampling", choices=["pca", "fibonacci", "random"], default="pca")
+    parser.add_argument("--adaptive-framing", action="store_true", default=True)
+    parser.add_argument("--no-adaptive-framing", action="store_true", help="Disable adaptive framing")
     parser.add_argument("--no-cache", action="store_true")
     parser.add_argument("--save-cache", action="store_true", help="Upload mesh cache with outputs")
     parser.add_argument("--task-index", type=int, default=None, help="Task index (or BATCH_TASK_INDEX)")
@@ -234,6 +240,8 @@ def main():
         projection=args.projection,
         auto_margin=args.auto_margin,
         cache=not args.no_cache,
+        sampling=args.sampling,
+        adaptive_framing=args.adaptive_framing and not args.no_adaptive_framing,
     )
     
     logger.info(f"Generated {len(manifest_entries)} render entries")

@@ -96,7 +96,10 @@ def cmd_generate_dataset(args):
             "--task-index", str(i),
             "--total-tasks", str(num_tasks),
             "--provider", args.provider,
+            "--sampling", args.sampling,
         ]
+        if args.sampling == "pca":
+            cmd_args.append("--adaptive-framing")
         if args.auto_margin and not args.no_auto_margin:
             cmd_args.append("--auto-margin")
         if args.no_cache:
@@ -274,6 +277,8 @@ def main():
     gen_parser.add_argument("--projection", choices=["ortho", "persp"], default="ortho")
     gen_parser.add_argument("--auto-margin", action="store_true", default=True, help="Auto-expand margin if needed")
     gen_parser.add_argument("--no-auto-margin", action="store_true", help="Disable auto-margin")
+    gen_parser.add_argument("--sampling", choices=["pca", "fibonacci", "random"], default="pca",
+                           help="Camera sampling strategy (default: pca)")
     gen_parser.add_argument("--no-cache", action="store_true")
     gen_parser.add_argument("--save-cache", action="store_true", help="Upload mesh cache for later reuse")
     gen_parser.add_argument("--parallelism", type=int, default=10)
