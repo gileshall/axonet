@@ -62,7 +62,7 @@ def _extract_id_from_path(path: Union[str, Path]) -> str:
 
 class NeuronCLIPDataset(Dataset):
     """Dataset for CLIP-style contrastive training with neuron images and text.
-    
+
     Loads image renders and pairs them with text descriptions generated
     from metadata using an adapter.
     """
@@ -76,21 +76,23 @@ class NeuronCLIPDataset(Dataset):
         id_column: str = "cell_specimen_id",
         text_generator: Optional[NeuronTextGenerator] = None,
         transform: Optional[Callable] = None,
+        image_size: Optional[int] = None,
     ):
         self.data_root = Path(data_root)
         self.adapter = adapter
         self.id_column = id_column
         self.transform = transform
-        
+        self.image_size = image_size
+
         if text_generator is None:
             text_generator = NeuronTextGenerator(adapter)
         self.text_generator = text_generator
-        
+
         manifest_entries = self._load_manifest(manifest_path)
         metadata_dict = self._load_metadata(metadata_path, id_column)
-        
+
         self.entries = self._pair_manifest_metadata(manifest_entries, metadata_dict)
-        
+
         if len(self.entries) == 0:
             raise ValueError(
                 f"No matching entries found between manifest and metadata. "
@@ -194,14 +196,23 @@ class NeuronCLIPDataset(Dataset):
             img = np.mean(img, axis=2, dtype=np.float32) / 255.0
         else:
             img = img.astype(np.float32) / 255.0
-        
+
         input_tensor = torch.from_numpy(img).unsqueeze(0)
-        
+
+        # Resize if image_size is specified
+        if self.image_size is not None:
+            input_tensor = torch.nn.functional.interpolate(
+                input_tensor.unsqueeze(0),
+                size=(self.image_size, self.image_size),
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(0)
+
         if self.transform is not None:
             input_tensor = self.transform(input_tensor)
-        
+
         text = self.text_generator(metadata)
-        
+
         return {
             "input": input_tensor,
             "text": text,

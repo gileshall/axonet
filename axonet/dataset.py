@@ -19,7 +19,7 @@ Usage
 python neuro_dataset_generator.py \
   --swc-dir /path/to/swc \
   --out /path/to/dataset \
-  --views 24 --width 1024 --height 768 \
+  --views 24 --width 512 --height 512 \
   --segments 32 --projection ortho --margin 0.85 \
   --min-qc 0.75 --qc-retries 5 --auto-margin
 
@@ -273,8 +273,8 @@ def main():
     p.add_argument("--swc-dir", type=Path, required=True, help="Directory containing .swc files (searched recursively)")
     p.add_argument("--out", type=Path, required=True, help="Output dataset directory")
     p.add_argument("--views", type=int, default=24, help="Number of viewpoints per SWC")
-    p.add_argument("--width", type=int, default=1024)
-    p.add_argument("--height", type=int, default=768)
+    p.add_argument("--width", type=int, default=512)
+    p.add_argument("--height", type=int, default=512)
     p.add_argument("--segments", type=int, default=32, help="Cylinder segments when tessellating neurites")
     p.add_argument("--projection", choices=["ortho", "perspective"], default="ortho")
     p.add_argument("--fovy", type=float, default=55.0, help="Perspective vertical FOV in degrees (if projection=perspective)")

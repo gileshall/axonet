@@ -66,8 +66,8 @@ def download_inputs(
 def generate_renders(
     entries: List[dict],
     output_dir: Path,
-    width: int = 1024,
-    height: int = 1024,
+    width: int = 512,
+    height: int = 512,
     views: int = 24,
     segments: int = 32,
     supersample_factor: int = 4,
@@ -165,8 +165,8 @@ def main():
     parser.add_argument("--manifest", required=True, help="Input manifest (local or gs://)")
     parser.add_argument("--swc-prefix", required=True, help="SWC files prefix (local or gs://)")
     parser.add_argument("--output", required=True, help="Output location (local or gs://)")
-    parser.add_argument("--width", type=int, default=1024)
-    parser.add_argument("--height", type=int, default=1024)
+    parser.add_argument("--width", type=int, default=512)
+    parser.add_argument("--height", type=int, default=512)
     parser.add_argument("--views", type=int, default=24)
     parser.add_argument("--segments", type=int, default=32)
     parser.add_argument("--supersample-factor", type=int, default=4)

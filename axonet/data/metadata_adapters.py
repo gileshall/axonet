@@ -92,6 +92,45 @@ class AllenAdapter(MetadataAdapter):
 class NeuroMorphoAdapter(MetadataAdapter):
     """Adapter for NeuroMorpho.org data."""
 
+    # Priority order for cell types (more specific morphological types first)
+    CELL_TYPE_PRIORITY = [
+        # Specific morphological types
+        "basket",
+        "chandelier",
+        "martinotti",
+        "bitufted",
+        "bipolar",
+        "multipolar",
+        "stellate",
+        "granule",
+        "purkinje",
+        "mitral",
+        "medium spiny",
+        # Broad excitatory/inhibitory
+        "pyramidal",
+        "interneuron",
+        # Molecular markers
+        "parvalbumin",
+        "somatostatin",
+        "VIP",
+        # Generic fallback
+        "principal cell",
+    ]
+
+    # Primary brain regions (broader categories first)
+    PRIMARY_REGIONS = [
+        "neocortex",
+        "hippocampus",
+        "cerebellum",
+        "thalamus",
+        "striatum",
+        "amygdala",
+        "olfactory bulb",
+        "brainstem",
+        "spinal cord",
+        "retina",
+    ]
+
     def get_neuron_id(self, entry: Dict[str, Any]) -> str:
         return str(entry.get("neuron_id", entry.get("neuron_name", "")))
 
@@ -110,25 +149,103 @@ class NeuroMorphoAdapter(MetadataAdapter):
     def get_species(self, entry: Dict[str, Any]) -> str:
         return entry.get("species", "unknown")
 
+    def _extract_primary_cell_type(self, cell_types: List[str]) -> Optional[str]:
+        """Extract the most informative cell type from a list."""
+        if not cell_types:
+            return None
+
+        cell_types_lower = [ct.lower() for ct in cell_types]
+
+        # Find highest priority match
+        for priority_type in self.CELL_TYPE_PRIORITY:
+            for i, ct in enumerate(cell_types_lower):
+                if priority_type in ct:
+                    return cell_types[i]
+
+        # Fall back to first non-generic type
+        for ct in cell_types:
+            if ct.lower() not in ("principal cell", "neuron"):
+                return ct
+
+        return cell_types[0] if cell_types else None
+
+    def _extract_primary_region(self, regions: List[str]) -> Optional[str]:
+        """Extract the primary brain region from a list."""
+        if not regions:
+            return None
+
+        regions_lower = [r.lower() for r in regions]
+
+        # Find primary region
+        for primary in self.PRIMARY_REGIONS:
+            for i, r in enumerate(regions_lower):
+                if primary in r or r in primary:
+                    return regions[i]
+
+        # Fall back to first region
+        return regions[0] if regions else None
+
+    def _extract_layer(self, regions: List[str]) -> Optional[str]:
+        """Extract cortical layer from brain region list."""
+        import re
+
+        for region in regions:
+            # Match patterns like "layer 4", "layer 2-3", "layer 5/6"
+            match = re.search(r"layer\s*(\d+(?:[/-]\d+)?)", region.lower())
+            if match:
+                return f"layer {match.group(1)}"
+
+        return None
+
     def to_text_description(self, entry: Dict[str, Any]) -> str:
+        """Generate natural language description for CLIP training.
+
+        Examples:
+        - "a stellate cell from neocortex layer 4"
+        - "a pyramidal neuron from hippocampus"
+        - "a parvalbumin-positive interneuron from neocortex layer 5"
+        """
+        cell_types = entry.get("cell_type", [])
+        if isinstance(cell_types, str):
+            cell_types = [cell_types]
+
+        regions = entry.get("brain_region", [])
+        if isinstance(regions, str):
+            regions = [regions]
+
+        # Extract key attributes
+        primary_type = self._extract_primary_cell_type(cell_types)
+        primary_region = self._extract_primary_region(regions)
+        layer = self._extract_layer(regions)
+
+        # Build description
         parts = []
-        
-        species = self.get_species(entry)
-        if species and species != "unknown":
-            parts.append(species)
-        
-        cell_type = self.get_cell_type(entry)
-        if cell_type and cell_type != "unknown":
-            parts.append(cell_type)
-        
-        region = self.get_brain_region(entry)
-        if region and region != "unknown":
-            parts.append(f"from {region}")
-        
-        if not parts:
+
+        # Cell type
+        if primary_type:
+            # Clean up the type
+            cell_desc = primary_type.lower()
+            # Add "cell" or "neuron" suffix if needed
+            if not any(w in cell_desc for w in ("cell", "neuron")):
+                cell_desc = f"{cell_desc} neuron"
+            parts.append(cell_desc)
+        else:
             parts.append("neuron")
-        
-        return " ".join(parts)
+
+        # Brain region and layer
+        if primary_region:
+            location = primary_region.lower()
+            if layer:
+                location = f"{location} {layer}"
+            parts.append(f"from {location}")
+
+        # Build final description with article
+        description = " ".join(parts)
+
+        # Add appropriate article
+        if description[0] in "aeiou":
+            return f"an {description}"
+        return f"a {description}"
 
 
 class GenericAdapter(MetadataAdapter):

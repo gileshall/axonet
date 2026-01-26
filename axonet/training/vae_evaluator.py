@@ -229,8 +229,8 @@ def create_false_color_mask(mask: np.ndarray, class_colors: Dict[int, np.ndarray
 def render_swc_to_input(
     swc_path: Path,
     *,
-    width: int = 1024,
-    height: int = 1024,
+    width: int = 512,
+    height: int = 512,
     segments: int = 18,
     radius_scale: float = 1.0,
     radius_adaptive_alpha: float = 0.0,
@@ -357,8 +357,8 @@ def evaluate_batch(
     model: SegVAE2D,
     device: str,
     *,
-    width: int = 1024,
-    height: int = 1024,
+    width: int = 512,
+    height: int = 512,
     batch_size: int = 8,
     save_visualizations: bool = False,
     output_dir: Optional[Path] = None,
@@ -766,8 +766,8 @@ def main():
     
     parser.add_argument("--pattern", type=str, default="*.swc", help="Glob pattern for SWC files")
     parser.add_argument("--batch-size", type=int, default=8, help="Batch size for processing")
-    parser.add_argument("--width", type=int, default=1024, help="Render width")
-    parser.add_argument("--height", type=int, default=1024, help="Render height")
+    parser.add_argument("--width", type=int, default=512, help="Render width")
+    parser.add_argument("--height", type=int, default=512, help="Render height")
     parser.add_argument("--device", type=str, default=None, help="Device (mps/cuda/cpu, auto-detect if not set)")
     parser.add_argument("--cache-dir", type=Path, default=None, help="Directory for caching rendered outputs")
     parser.add_argument("--num-workers", type=int, default=None, help="Number of worker processes for rendering (default: half of CPU count)")

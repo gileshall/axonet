@@ -54,8 +54,9 @@ class SegVAE2D_CLIP(nn.Module):
         super().__init__()
         self.base_model = base_model
         self.freeze_encoder = freeze_encoder
-        
-        latent_channels = base_model.latent_channels
+
+        # Infer latent_channels from the mu layer output channels
+        latent_channels = base_model.mu.out_channels
         self.image_proj = CLIPProjectionHead(
             input_dim=latent_channels,
             hidden_dim=hidden_dim,

@@ -559,8 +559,8 @@ def main():
     data_group.add_argument("--batch-size", type=int, default=8, help="Batch size")
     data_group.add_argument("--num-workers", type=int, default=4, help="DataLoader workers")
     data_group.add_argument(
-        "--image-size", type=int, default=256,
-        help="Resize images to this size (default: 256, use 0 for original size)"
+        "--image-size", type=int, default=512,
+        help="Resize images to this size (default: 512, use 0 for original size)"
     )
 
     # Model arguments

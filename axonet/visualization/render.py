@@ -811,8 +811,8 @@ class NeuroRenderCore:
 def render_swc_to_image(
     swc_path: Path | str,
     *,
-    width: int = 1024,
-    height: int = 768,
+    width: int = 512,
+    height: int = 512,
     segments: int = 32,
     perspective: bool = False,
     fovy: float = 55.0,

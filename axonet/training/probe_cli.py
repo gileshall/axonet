@@ -64,10 +64,10 @@ def main():
                        help="Use z (stochastic) instead of mu (deterministic)")
     parser.add_argument("--embedding-reduce", choices=["mean", "max", "flatten"], default="mean",
                        help="How to reduce spatial dimensions (default: mean)")
-    parser.add_argument("--width", type=int, default=1024,
-                       help="Render width (default: 1024)")
-    parser.add_argument("--height", type=int, default=1024,
-                       help="Render height (default: 1024)")
+    parser.add_argument("--width", type=int, default=512,
+                       help="Render width (default: 512)")
+    parser.add_argument("--height", type=int, default=512,
+                       help="Render height (default: 512)")
     
     parser.add_argument("--pose-sampling", choices=["random", "all", "first"], default="random",
                        help="How to sample poses (default: random)")
