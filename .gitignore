@@ -1,8 +1,31 @@
-*pycache*
-/*morph*
-/annotations*
-*egg*
-checkpoints
-logs
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Data directories (download separately)
+/allen_*/
+/neuromorpho_*/
+/morph_*/
+
+# Experiment artifacts
+/training/
+/eval/
+/checkpoints/
+/logs/
+/wandb/
+
+# IDE / tools
+.claude/
+.venv/
+.DS_Store
+
+# Legacy
+/tarpit/
+/annotations*/
+
+# One-off scripts
 /*.py
-*.txt

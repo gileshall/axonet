@@ -2,8 +2,6 @@ numpy>=1.20.0
 scipy>=1.7.0
 networkx>=2.6.0
 trimesh>=3.9.0
-svgwrite>=1.4.0
-cairosvg>=2.5.0
 pillow>=8.0.0
 matplotlib
 pyglet
@@ -13,6 +11,4 @@ torch
 torchvision
 pyyaml
 moderngl
-sentence-transformers
-litellm
 requests

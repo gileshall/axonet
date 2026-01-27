@@ -44,7 +44,6 @@ setup(
             "mypy>=0.910",
         ],
         "viz": [
-            "matplotlib>=3.3.0",
             "plotly>=5.0.0",
             "pyvista>=0.30.0",
         ],
@@ -59,8 +58,6 @@ setup(
     },
     entry_points={
         "console_scripts": [
-            "axonet-analyze=axonet.cli:analyze",
-            "axonet-visualize=axonet.cli:visualize",
             "axonet-cloud=axonet.cloud.cli:main",
         ],
     },
