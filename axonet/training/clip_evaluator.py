@@ -251,6 +251,21 @@ def extract_region_from_text(text: str) -> str:
     return "other"
 
 
+# Species with enough neurons to meaningfully evaluate
+EVAL_SPECIES = [
+    "mouse", "rat", "human", "chimpanzee", "giraffe", "monkey",
+    "leopard", "cheetah", "C. elegans", "Lion",
+]
+
+
+def extract_species_from_metadata(metadata: Dict[str, Any]) -> str:
+    """Extract species directly from metadata entry."""
+    species = metadata.get("species", "unknown")
+    if isinstance(species, str) and species.lower() not in ("", "unknown", "not reported"):
+        return species
+    return "other"
+
+
 # ---------------------------------------------------------------------------
 # Zero-shot classification
 # ---------------------------------------------------------------------------
@@ -324,6 +339,255 @@ def run_zero_shot_eval(
         results["region_report"] = classification_report(gt_f, pr_f, zero_division=0)
         results["region_classes"] = region_classes
         results["region_n"] = len(gt_f)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Species zero-shot classification
+# ---------------------------------------------------------------------------
+
+def run_species_zero_shot(
+    model: CLIPLightning,
+    image_embeds: torch.Tensor,
+    metadata_list: List[Dict[str, Any]],
+    device: str = "cpu",
+) -> Dict[str, Any]:
+    """Zero-shot species classification using neuron-level embeddings."""
+    gt_species = [extract_species_from_metadata(m) for m in metadata_list]
+
+    # Determine which species are actually present
+    species_counts = {}
+    for s in gt_species:
+        species_counts[s] = species_counts.get(s, 0) + 1
+
+    # Only evaluate species with >= 5 examples
+    eval_species = [s for s in EVAL_SPECIES if species_counts.get(s, 0) >= 5]
+    if not eval_species:
+        return {"species_accuracy": None, "species_n": 0, "note": "no eval species with >= 5 samples"}
+
+    preds = zero_shot_classification(
+        model, image_embeds, eval_species,
+        prompt_template="a {} neuron", device=device,
+    )
+    pred_species = [eval_species[i] for i in preds]
+
+    valid_mask = [gt in eval_species for gt in gt_species]
+    gt_f = [gt for gt, v in zip(gt_species, valid_mask) if v]
+    pr_f = [p for p, v in zip(pred_species, valid_mask) if v]
+
+    results: Dict[str, Any] = {}
+    if gt_f:
+        results["species_accuracy"] = accuracy_score(gt_f, pr_f) * 100
+        results["species_report"] = classification_report(gt_f, pr_f, zero_division=0)
+        results["species_classes"] = eval_species
+        results["species_n"] = len(gt_f)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Morphometric retrieval
+# ---------------------------------------------------------------------------
+
+def run_morphometric_retrieval(
+    model: CLIPLightning,
+    image_embeds: torch.Tensor,
+    metadata_list: List[Dict[str, Any]],
+    device: str = "cpu",
+    k: int = 50,
+) -> Dict[str, Any]:
+    """Test whether morphometric text queries retrieve neurons with matching properties.
+
+    For example: does "a large neuron" retrieve neurons with high total length?
+    We measure this by checking whether the retrieved set has a significantly
+    higher mean value than the population for the relevant morphometric.
+    """
+    queries = [
+        {
+            "text": "a large neuron",
+            "morph_key": "length",
+            "direction": "high",  # expect high values
+        },
+        {
+            "text": "a small, compact neuron",
+            "morph_key": "length",
+            "direction": "low",
+        },
+        {
+            "text": "a densely branched neuron",
+            "morph_key": "n_bifs",
+            "direction": "high",
+        },
+        {
+            "text": "a sparsely branched neuron",
+            "morph_key": "n_bifs",
+            "direction": "low",
+        },
+        {
+            "text": "a sprawling neuron with long dendrites",
+            "morph_key": "length",
+            "direction": "high",
+        },
+    ]
+
+    image_embeds_norm = F.normalize(image_embeds.to(device), p=2, dim=-1)
+    results = {}
+
+    for q in queries:
+        with torch.no_grad():
+            query_embed = model.text_encoder([q["text"]])
+            query_embed = F.normalize(query_embed.to(device), p=2, dim=-1)
+
+        sims = (image_embeds_norm @ query_embed.T).squeeze()
+        top_indices = torch.argsort(sims, descending=True)[:k].cpu().numpy()
+
+        # Get morphometric values for top-k and population
+        morph_key = q["morph_key"]
+        top_values = []
+        for idx in top_indices:
+            morph = metadata_list[idx].get("morphometry", {})
+            if morph and isinstance(morph, dict):
+                val = morph.get(morph_key)
+                if val is not None:
+                    top_values.append(float(val))
+
+        pop_values = []
+        for m in metadata_list:
+            morph = m.get("morphometry", {})
+            if morph and isinstance(morph, dict):
+                val = morph.get(morph_key)
+                if val is not None:
+                    pop_values.append(float(val))
+
+        if not top_values or not pop_values:
+            continue
+
+        top_mean = np.mean(top_values)
+        pop_mean = np.mean(pop_values)
+        pop_std = np.std(pop_values)
+
+        # Effect size (Cohen's d)
+        effect_size = (top_mean - pop_mean) / pop_std if pop_std > 0 else 0.0
+
+        # For "low" direction queries, we expect negative effect size
+        directional_correct = (
+            (q["direction"] == "high" and effect_size > 0) or
+            (q["direction"] == "low" and effect_size < 0)
+        )
+
+        results[q["text"]] = {
+            "morph_key": morph_key,
+            "direction": q["direction"],
+            "top_k_mean": float(top_mean),
+            "population_mean": float(pop_mean),
+            "effect_size": float(effect_size),
+            "directional_correct": directional_correct,
+            "n_top_with_data": len(top_values),
+        }
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Compositional query evaluation
+# ---------------------------------------------------------------------------
+
+def run_compositional_queries(
+    model: CLIPLightning,
+    image_embeds: torch.Tensor,
+    texts: List[str],
+    metadata_list: List[Dict[str, Any]],
+    device: str = "cpu",
+    k: int = 10,
+) -> Dict[str, Any]:
+    """Test retrieval with compositional queries that combine multiple attributes.
+
+    These queries combine species + cell type + region in ways that may not
+    have been seen as exact training strings, testing compositional understanding.
+    """
+    queries = [
+        {
+            "text": "a mouse pyramidal neuron from hippocampus",
+            "expected": {"species": "mouse", "cell_type": "pyramidal", "region": "hippocampus"},
+        },
+        {
+            "text": "a rat interneuron from neocortex",
+            "expected": {"species": "rat", "cell_type": "interneuron", "region": "neocortex"},
+        },
+        {
+            "text": "a human pyramidal neuron from neocortex",
+            "expected": {"species": "human", "cell_type": "pyramidal", "region": "neocortex"},
+        },
+        {
+            "text": "a mouse granule neuron from cerebellum",
+            "expected": {"species": "mouse", "cell_type": "granule", "region": "cerebellum"},
+        },
+        {
+            "text": "a rat pyramidal neuron from hippocampus",
+            "expected": {"species": "rat", "cell_type": "pyramidal", "region": "hippocampus"},
+        },
+        {
+            "text": "a mouse stellate neuron from neocortex",
+            "expected": {"species": "mouse", "cell_type": "stellate", "region": "neocortex"},
+        },
+        {
+            "text": "a large mouse neuron from neocortex",
+            "expected": {"species": "mouse", "region": "neocortex"},
+        },
+        {
+            "text": "a chimpanzee pyramidal neuron from neocortex",
+            "expected": {"species": "chimpanzee", "cell_type": "pyramidal", "region": "neocortex"},
+        },
+    ]
+
+    image_embeds_norm = F.normalize(image_embeds.to(device), p=2, dim=-1)
+    results = {}
+
+    for q in queries:
+        with torch.no_grad():
+            query_embed = model.text_encoder([q["text"]])
+            query_embed = F.normalize(query_embed.to(device), p=2, dim=-1)
+
+        sims = (image_embeds_norm @ query_embed.T).squeeze()
+        top_indices = torch.argsort(sims, descending=True)[:k].cpu().numpy()
+        top_sims = [sims[i].item() for i in top_indices]
+
+        # Check each retrieved result against expected attributes
+        match_counts = {attr: 0 for attr in q["expected"]}
+        full_matches = 0
+
+        for idx in top_indices:
+            meta = metadata_list[idx]
+            text = texts[idx]
+
+            attr_match = {}
+            expected = q["expected"]
+
+            if "species" in expected:
+                sp = extract_species_from_metadata(meta)
+                attr_match["species"] = (sp.lower() == expected["species"].lower())
+
+            if "cell_type" in expected:
+                attr_match["cell_type"] = (expected["cell_type"].lower() in text.lower())
+
+            if "region" in expected:
+                attr_match["region"] = (expected["region"].lower() in text.lower())
+
+            for attr, matched in attr_match.items():
+                if matched:
+                    match_counts[attr] += 1
+
+            if all(attr_match.values()):
+                full_matches += 1
+
+        results[q["text"]] = {
+            "full_match_precision": full_matches / k * 100,
+            "per_attribute_precision": {
+                attr: count / k * 100 for attr, count in match_counts.items()
+            },
+            "top_similarity": float(top_sims[0]) if top_sims else 0.0,
+        }
 
     return results
 
@@ -444,6 +708,9 @@ def print_report(
     pose_stats: Dict[str, float],
     pooling: str,
     output_path: Optional[Path] = None,
+    species_results: Optional[Dict[str, Any]] = None,
+    morphometric_results: Optional[Dict[str, Any]] = None,
+    compositional_results: Optional[Dict[str, Any]] = None,
 ):
     """Print evaluation report."""
     lines = []
@@ -488,6 +755,36 @@ def print_report(
         lines.append(f"Brain Region Accuracy: {zero_shot_results['region_accuracy']:.1f}%"
                      f"  (n={zero_shot_results['region_n']})")
 
+    # Species zero-shot
+    if species_results and "species_accuracy" in species_results:
+        lines.append(f"\n[Species Zero-Shot Classification (neuron-level)]")
+        lines.append("-" * 40)
+        lines.append(f"Species Accuracy: {species_results['species_accuracy']:.1f}%"
+                     f"  (n={species_results['species_n']})")
+        if "species_report" in species_results:
+            lines.append("\n" + species_results["species_report"])
+
+    # Morphometric retrieval
+    if morphometric_results:
+        lines.append(f"\n[Morphometric Retrieval (top-50)]")
+        lines.append("-" * 40)
+        for query_text, r in morphometric_results.items():
+            direction_mark = "OK" if r["directional_correct"] else "WRONG"
+            lines.append(f"\nQuery: \"{query_text}\"")
+            lines.append(f"  Key: {r['morph_key']}, expected: {r['direction']}")
+            lines.append(f"  Top-50 mean: {r['top_k_mean']:.1f}, population mean: {r['population_mean']:.1f}")
+            lines.append(f"  Effect size (Cohen's d): {r['effect_size']:.2f}  [{direction_mark}]")
+
+    # Compositional queries
+    if compositional_results:
+        lines.append(f"\n[Compositional Query Retrieval (top-10)]")
+        lines.append("-" * 40)
+        for query_text, r in compositional_results.items():
+            lines.append(f"\nQuery: \"{query_text}\"")
+            lines.append(f"  Full-match precision: {r['full_match_precision']:.0f}%")
+            for attr, prec in r["per_attribute_precision"].items():
+                lines.append(f"    {attr}: {prec:.0f}%")
+
     # Novel query tests
     lines.append("\n[Novel Query Retrieval (neuron-level)]")
     lines.append("-" * 40)
@@ -512,6 +809,32 @@ def print_report(
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
+def _load_metadata_by_id(metadata_path: Path, id_column: str) -> Dict[str, Dict[str, Any]]:
+    """Load metadata indexed by neuron ID."""
+    metadata = {}
+    path = Path(metadata_path)
+    if path.suffix == ".jsonl":
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    e = json.loads(line)
+                    key = str(e.get(id_column, ""))
+                    if key:
+                        metadata[key] = e
+    elif path.suffix == ".json":
+        with open(path) as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            for e in data:
+                key = str(e.get(id_column, ""))
+                if key:
+                    metadata[key] = e
+        else:
+            metadata = data
+    return metadata
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -570,6 +893,11 @@ def main():
     print(f"Loading model from {args.checkpoint}...")
     model = load_clip_model(args.checkpoint, device=device)
 
+    # Load metadata for species/morphometric evaluation
+    print(f"Loading metadata from {args.metadata}...")
+    metadata_by_id = _load_metadata_by_id(args.metadata, args.id_column)
+    print(f"  {len(metadata_by_id):,} metadata entries")
+
     # Create dataset
     adapter = get_adapter(args.source)
     text_gen = NeuronTextGenerator(adapter, augment=False)
@@ -620,15 +948,36 @@ def main():
     texts = agg["texts"]
     neuron_ids = agg["neuron_ids"]
 
+    # Build neuron-level metadata list (aligned with aggregated embeddings)
+    metadata_list = []
+    for nid in neuron_ids:
+        metadata_list.append(metadata_by_id.get(str(nid), {}))
+
     # Retrieval
     print("\nComputing retrieval metrics...")
     retrieval_metrics = compute_retrieval_metrics(image_embeds, text_embeds, texts)
 
-    # Zero-shot
+    # Zero-shot cell type & region
     print("Running zero-shot classification...")
     zero_shot_results = run_zero_shot_eval(model, image_embeds, texts, device=device)
 
-    # Novel queries
+    # Species zero-shot
+    print("Running species zero-shot classification...")
+    species_results = run_species_zero_shot(model, image_embeds, metadata_list, device=device)
+
+    # Morphometric retrieval
+    print("Testing morphometric retrieval...")
+    morphometric_results = run_morphometric_retrieval(
+        model, image_embeds, metadata_list, device=device
+    )
+
+    # Compositional queries
+    print("Testing compositional queries...")
+    compositional_results = run_compositional_queries(
+        model, image_embeds, texts, metadata_list, device=device
+    )
+
+    # Novel queries (original)
     print("Testing novel queries...")
     novel_query_results = run_novel_query_test(
         model, image_embeds, texts, neuron_ids, device=device
@@ -649,6 +998,14 @@ def main():
             f"Neuron Embeddings by Brain Region ({args.pooling} pooling)",
             args.output_dir / "tsne_region.png",
         )
+        # Species t-SNE
+        species_labels = [extract_species_from_metadata(m) for m in metadata_list]
+        create_tsne_visualization(
+            image_embeds, species_labels,
+            f"Neuron Embeddings by Species ({args.pooling} pooling)",
+            args.output_dir / "tsne_species.png",
+            max_samples=2000,
+        )
 
     # Report
     print_report(
@@ -656,6 +1013,9 @@ def main():
         n_images=n_raw, n_neurons=n_neurons,
         pose_stats=pose_stats, pooling=args.pooling,
         output_path=args.output_dir / "eval_report.txt",
+        species_results=species_results,
+        morphometric_results=morphometric_results,
+        compositional_results=compositional_results,
     )
 
     # Save machine-readable metrics
@@ -671,6 +1031,17 @@ def main():
             k: v for k, v in zero_shot_results.items()
             if not isinstance(v, np.ndarray) and "report" not in k
         },
+        "species_zero_shot": {
+            k: v for k, v in species_results.items()
+            if not isinstance(v, np.ndarray) and "report" not in k
+        } if species_results else {},
+        "morphometric_retrieval": {
+            q: {k: v for k, v in r.items()}
+            for q, r in morphometric_results.items()
+        } if morphometric_results else {},
+        "compositional_queries": {
+            q: r for q, r in compositional_results.items()
+        } if compositional_results else {},
         "novel_queries": {
             q: {"top_10_precision": r["top_10_precision"]}
             for q, r in novel_query_results.items()

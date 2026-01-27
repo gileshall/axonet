@@ -93,12 +93,22 @@ def cmd_generate_dataset(args):
             "--supersample-factor", str(args.supersample_factor),
             "--margin", str(args.margin),
             "--projection", args.projection,
+            "--fovy", str(args.fovy),
+            "--min-qc", str(args.min_qc),
+            "--qc-retries", str(args.qc_retries),
+            "--radius-scale", str(args.radius_scale),
+            "--radius-adaptive-alpha", str(args.radius_adaptive_alpha),
+            "--radius-ref-percentile", str(args.radius_ref_percentile),
+            "--seed", str(args.seed),
+            "--bg", *[str(c) for c in args.bg],
             "--task-index", str(i),
             "--total-tasks", str(num_tasks),
             "--provider", args.provider,
             "--sampling", args.sampling,
         ]
-        if args.sampling == "pca":
+        if args.depth_shading:
+            cmd_args.append("--depth-shading")
+        if args.adaptive_framing:
             cmd_args.append("--adaptive-framing")
         if args.auto_margin and not args.no_auto_margin:
             cmd_args.append("--auto-margin")
@@ -272,13 +282,27 @@ def main():
     gen_parser.add_argument("--height", type=int, default=512)
     gen_parser.add_argument("--views", type=int, default=24)
     gen_parser.add_argument("--segments", type=int, default=32, help="Mesh segments per cylinder")
-    gen_parser.add_argument("--supersample-factor", type=int, default=4, help="Supersampling factor")
+    gen_parser.add_argument("--supersample-factor", type=int, default=2, help="Supersampling factor")
     gen_parser.add_argument("--margin", type=float, default=0.40, help="Camera margin around neuron")
     gen_parser.add_argument("--projection", choices=["ortho", "persp"], default="ortho")
-    gen_parser.add_argument("--auto-margin", action="store_true", default=True, help="Auto-expand margin if needed")
+    gen_parser.add_argument("--fovy", type=float, default=55.0, help="Field of view in degrees")
+    gen_parser.add_argument("--depth-shading", action="store_true", help="Enable depth shading")
+    gen_parser.add_argument("--bg", type=float, nargs=4, default=(0, 0, 0, 1), metavar=("R", "G", "B", "A"),
+                           help="Background color RGBA")
+    gen_parser.add_argument("--min-qc", type=float, default=0.7, help="Minimum QC fraction")
+    gen_parser.add_argument("--qc-retries", type=int, default=5, help="QC retry attempts per view")
+    gen_parser.add_argument("--radius-scale", type=float, default=1.0, help="Global radius scale factor")
+    gen_parser.add_argument("--radius-adaptive-alpha", type=float, default=0.0,
+                           help="Adaptive radius scaling strength (0 disables)")
+    gen_parser.add_argument("--radius-ref-percentile", type=float, default=50.0,
+                           help="Reference percentile for adaptive radius scaling")
+    gen_parser.add_argument("--auto-margin", action="store_true", help="Auto-expand margin if needed")
     gen_parser.add_argument("--no-auto-margin", action="store_true", help="Disable auto-margin")
     gen_parser.add_argument("--sampling", choices=["pca", "fibonacci", "random"], default="pca",
                            help="Camera sampling strategy (default: pca)")
+    gen_parser.add_argument("--adaptive-framing", action="store_true",
+                           help="Per-view adaptive ortho_scale based on projected extent")
+    gen_parser.add_argument("--seed", type=int, default=1234, help="Random seed")
     gen_parser.add_argument("--no-cache", action="store_true")
     gen_parser.add_argument("--save-cache", action="store_true", help="Upload mesh cache for later reuse")
     gen_parser.add_argument("--parallelism", type=int, default=10)

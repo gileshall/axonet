@@ -12,7 +12,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 logging.basicConfig(
     level=logging.INFO,
@@ -70,30 +70,39 @@ def generate_renders(
     height: int = 512,
     views: int = 24,
     segments: int = 32,
-    supersample_factor: int = 4,
+    supersample_factor: int = 2,
     margin: float = 0.40,
     projection: str = "ortho",
-    auto_margin: bool = True,
+    auto_margin: bool = False,
     cache: bool = True,
     sampling: str = "pca",
-    adaptive_framing: bool = True,
+    adaptive_framing: bool = False,
+    fovy: float = 55.0,
+    depth_shading: bool = False,
+    background: Tuple[float, ...] = (0.0, 0.0, 0.0, 1.0),
+    min_qc: float = 0.7,
+    qc_retries: int = 5,
+    radius_scale: float = 1.0,
+    radius_adaptive_alpha: float = 0.0,
+    radius_ref_percentile: float = 50.0,
+    seed: int | None = 1234,
 ):
     """Generate rendered views for each neuron."""
     from axonet.training.dataset_generator import render_with_masks
-    
+
     output_dir.mkdir(parents=True, exist_ok=True)
     manifest_entries = []
-    
+
     for entry in entries:
         swc_path = Path(entry.get("local_swc") or entry.get("swc") or entry.get("path"))
         if not swc_path.exists():
             logger.warning(f"SWC not found: {swc_path}")
             continue
-        
+
         neuron_id = entry.get("neuron_id") or swc_path.stem
-        
+
         logger.info(f"Processing: {neuron_id}")
-        
+
         neuron_out_dir, render_entries = render_with_masks(
             swc_path=swc_path,
             out_dir=output_dir,
@@ -102,19 +111,19 @@ def generate_renders(
             width=width,
             height=height,
             segments=segments,
-            radius_scale=1.0,
-            radius_adaptive_alpha=0.0,
-            radius_ref_percentile=50.0,
+            radius_scale=radius_scale,
+            radius_adaptive_alpha=radius_adaptive_alpha,
+            radius_ref_percentile=radius_ref_percentile,
             projection=projection,
-            fovy=45.0,
+            fovy=fovy,
             margin=margin,
-            depth_shading=True,
-            background=(0.0, 0.0, 0.0, 1.0),
-            min_qc=0.1,
-            qc_retries=3,
+            depth_shading=depth_shading,
+            background=background,
+            min_qc=min_qc,
+            qc_retries=qc_retries,
             sampling=sampling,
             auto_margin=auto_margin,
-            seed=None,
+            seed=seed,
             supersample_factor=supersample_factor,
             cache=cache,
             cache_dir=None,
@@ -172,13 +181,22 @@ def main():
     parser.add_argument("--height", type=int, default=512)
     parser.add_argument("--views", type=int, default=24)
     parser.add_argument("--segments", type=int, default=32)
-    parser.add_argument("--supersample-factor", type=int, default=4)
+    parser.add_argument("--supersample-factor", type=int, default=2)
     parser.add_argument("--margin", type=float, default=0.40)
     parser.add_argument("--projection", choices=["ortho", "persp"], default="ortho")
-    parser.add_argument("--auto-margin", action="store_true", default=True)
+    parser.add_argument("--fovy", type=float, default=55.0)
+    parser.add_argument("--depth-shading", action="store_true")
+    parser.add_argument("--bg", type=float, nargs=4, default=(0, 0, 0, 1), metavar=("R", "G", "B", "A"))
+    parser.add_argument("--min-qc", type=float, default=0.7)
+    parser.add_argument("--qc-retries", type=int, default=5)
+    parser.add_argument("--radius-scale", type=float, default=1.0)
+    parser.add_argument("--radius-adaptive-alpha", type=float, default=0.0)
+    parser.add_argument("--radius-ref-percentile", type=float, default=50.0)
+    parser.add_argument("--auto-margin", action="store_true")
     parser.add_argument("--sampling", choices=["pca", "fibonacci", "random"], default="pca")
-    parser.add_argument("--adaptive-framing", action="store_true", default=True)
+    parser.add_argument("--adaptive-framing", action="store_true")
     parser.add_argument("--no-adaptive-framing", action="store_true", help="Disable adaptive framing")
+    parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--no-cache", action="store_true")
     parser.add_argument("--save-cache", action="store_true", help="Upload mesh cache with outputs")
     parser.add_argument("--task-index", type=int, default=None, help="Task index (or BATCH_TASK_INDEX)")
@@ -242,6 +260,15 @@ def main():
         cache=not args.no_cache,
         sampling=args.sampling,
         adaptive_framing=args.adaptive_framing and not args.no_adaptive_framing,
+        fovy=args.fovy,
+        depth_shading=args.depth_shading,
+        background=tuple(args.bg),
+        min_qc=args.min_qc,
+        qc_retries=args.qc_retries,
+        radius_scale=args.radius_scale,
+        radius_adaptive_alpha=args.radius_adaptive_alpha,
+        radius_ref_percentile=args.radius_ref_percentile,
+        seed=args.seed,
     )
     
     logger.info(f"Generated {len(manifest_entries)} render entries")

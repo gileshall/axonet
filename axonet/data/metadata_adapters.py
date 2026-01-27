@@ -34,6 +34,22 @@ class MetadataAdapter(ABC):
         """Generate text description for CLIP training."""
         ...
 
+    def get_description_parts(self, entry: Dict[str, Any]) -> Dict[str, Optional[str]]:
+        """Return structured description parts for multi-level text generation.
+
+        Returns a dict with keys: species, cell_type, brain_region, layer.
+        Values are None when the field is missing or uninformative.
+        """
+        species = self.get_species(entry)
+        cell_type = self.get_cell_type(entry)
+        region = self.get_brain_region(entry)
+        return {
+            "species": species if species and species != "unknown" else None,
+            "cell_type": cell_type if cell_type and cell_type != "unknown" else None,
+            "brain_region": region if region and region != "unknown" else None,
+            "layer": None,
+        }
+
     def get_metadata_fields(self, entry: Dict[str, Any]) -> Dict[str, str]:
         """Get all normalized metadata fields."""
         return {
@@ -68,24 +84,45 @@ class AllenAdapter(MetadataAdapter):
     def get_species(self, entry: Dict[str, Any]) -> str:
         return entry.get("species", "mouse")
 
+    def get_description_parts(self, entry: Dict[str, Any]) -> Dict[str, Optional[str]]:
+        species = entry.get("species", "mouse")
+        dendrite = entry.get("dendrite_type", "")
+        structure = entry.get("structure", "")
+        t_type = entry.get("T-type Label", "")
+
+        cell_desc = None
+        if dendrite:
+            cell_desc = dendrite.lower()
+            if not any(w in cell_desc for w in ("cell", "neuron")):
+                cell_desc = f"{cell_desc} neuron"
+        elif t_type:
+            cell_desc = t_type.lower()
+
+        return {
+            "species": species if species else None,
+            "cell_type": cell_desc,
+            "brain_region": structure.lower() if structure else None,
+            "layer": None,
+        }
+
     def to_text_description(self, entry: Dict[str, Any]) -> str:
         parts = []
-        
+
         dendrite = entry.get("dendrite_type", "")
         if dendrite:
             parts.append(dendrite)
-        
+
         structure = entry.get("structure", "")
         if structure:
             parts.append(structure)
-        
+
         t_type = entry.get("T-type Label", "")
         if t_type:
             parts.append(t_type)
-        
+
         if not parts:
             parts.append("neuron")
-        
+
         return " ".join(parts)
 
 
@@ -197,13 +234,11 @@ class NeuroMorphoAdapter(MetadataAdapter):
 
         return None
 
-    def to_text_description(self, entry: Dict[str, Any]) -> str:
-        """Generate natural language description for CLIP training.
+    def get_description_parts(self, entry: Dict[str, Any]) -> Dict[str, Optional[str]]:
+        """Return structured description parts for multi-level text generation.
 
-        Examples:
-        - "a stellate cell from neocortex layer 4"
-        - "a pyramidal neuron from hippocampus"
-        - "a parvalbumin-positive interneuron from neocortex layer 5"
+        Uses priority-based extraction to return the most informative
+        cell type, region, and layer from the (often multi-valued) metadata.
         """
         cell_types = entry.get("cell_type", [])
         if isinstance(cell_types, str):
@@ -213,30 +248,56 @@ class NeuroMorphoAdapter(MetadataAdapter):
         if isinstance(regions, str):
             regions = [regions]
 
-        # Extract key attributes
         primary_type = self._extract_primary_cell_type(cell_types)
         primary_region = self._extract_primary_region(regions)
         layer = self._extract_layer(regions)
+
+        species = entry.get("species", None)
+        if species and species.lower() in ("unknown", "not reported", ""):
+            species = None
+
+        # Clean cell type into natural phrasing
+        cell_desc = None
+        if primary_type:
+            cell_desc = primary_type.lower()
+            if not any(w in cell_desc for w in ("cell", "neuron")):
+                cell_desc = f"{cell_desc} neuron"
+
+        region_desc = None
+        if primary_region:
+            region_desc = primary_region.lower()
+
+        return {
+            "species": species,
+            "cell_type": cell_desc,
+            "brain_region": region_desc,
+            "layer": layer,
+        }
+
+    def to_text_description(self, entry: Dict[str, Any]) -> str:
+        """Generate natural language description for CLIP training.
+
+        Examples:
+        - "a stellate cell from neocortex layer 4"
+        - "a pyramidal neuron from hippocampus"
+        - "a parvalbumin-positive interneuron from neocortex layer 5"
+        """
+        parts_dict = self.get_description_parts(entry)
 
         # Build description
         parts = []
 
         # Cell type
-        if primary_type:
-            # Clean up the type
-            cell_desc = primary_type.lower()
-            # Add "cell" or "neuron" suffix if needed
-            if not any(w in cell_desc for w in ("cell", "neuron")):
-                cell_desc = f"{cell_desc} neuron"
-            parts.append(cell_desc)
+        if parts_dict["cell_type"]:
+            parts.append(parts_dict["cell_type"])
         else:
             parts.append("neuron")
 
         # Brain region and layer
-        if primary_region:
-            location = primary_region.lower()
-            if layer:
-                location = f"{location} {layer}"
+        if parts_dict["brain_region"]:
+            location = parts_dict["brain_region"]
+            if parts_dict["layer"]:
+                location = f"{location} {parts_dict['layer']}"
             parts.append(f"from {location}")
 
         # Build final description with article
