@@ -21,6 +21,11 @@ def _get_gcp_env() -> dict:
     for var in ["GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_REGION", "GOOGLE_CLOUD_ZONE", "AXONET_GCS_BUCKET"]:
         if os.environ.get(var):
             env[var] = os.environ[var]
+    # Ensure NVIDIA Container Toolkit mounts both compute AND graphics libs.
+    # Without "graphics", only CUDA is available and EGL/OpenGL falls back to
+    # Mesa software rendering.
+    env.setdefault("NVIDIA_VISIBLE_DEVICES", "all")
+    env.setdefault("NVIDIA_DRIVER_CAPABILITIES", "compute,graphics,utility")
     return env
 
 
@@ -102,6 +107,7 @@ def cmd_generate_dataset(args):
         "--total-tasks", str(num_tasks),
         "--provider", args.provider,
         "--sampling", args.sampling,
+        "--jobs", str(args.jobs),
     ]
     if args.depth_shading:
         cmd_args.append("--depth-shading")
@@ -311,7 +317,7 @@ def main():
     gen_parser.add_argument("--height", type=int, default=512)
     gen_parser.add_argument("--views", type=int, default=24)
     gen_parser.add_argument("--segments", type=int, default=32, help="Mesh segments per cylinder")
-    gen_parser.add_argument("--supersample-factor", type=int, default=2, help="Supersampling factor")
+    gen_parser.add_argument("--supersample-factor", type=int, default=4, help="Supersampling factor")
     gen_parser.add_argument("--margin", type=float, default=0.40, help="Camera margin around neuron")
     gen_parser.add_argument("--projection", choices=["ortho", "persp"], default="ortho")
     gen_parser.add_argument("--fovy", type=float, default=55.0, help="Field of view in degrees")
@@ -332,6 +338,8 @@ def main():
     gen_parser.add_argument("--adaptive-framing", action="store_true",
                            help="Per-view adaptive ortho_scale based on projected extent")
     gen_parser.add_argument("--seed", type=int, default=1234, help="Random seed")
+    gen_parser.add_argument("-j", "--jobs", type=int, default=1,
+                           help="Parallel render workers per task (1 = sequential)")
     gen_parser.add_argument("--no-cache", action="store_true")
     gen_parser.add_argument("--save-cache", action="store_true", help="Upload mesh cache for later reuse")
     gen_parser.add_argument("--parallelism", type=int, default=10)

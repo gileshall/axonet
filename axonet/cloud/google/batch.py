@@ -80,16 +80,35 @@ class GoogleBatch(BatchBackend):
         task_group.parallelism = min(parallelism, len(configs))
         
         task_spec = batch_v1.TaskSpec()
-        
+
+        runnables = []
+
+        # On Debian VMs, the NVIDIA Container Toolkit is installed by the
+        # batch agent but not registered with Docker.  A script runnable
+        # configures the nvidia runtime before the container starts.
+        if base_config.gpu_count > 0:
+            setup = batch_v1.Runnable()
+            setup.script = batch_v1.Runnable.Script()
+            setup.script.text = (
+                "#!/bin/bash\nset -e\n"
+                "nvidia-ctk runtime configure --runtime=docker\n"
+                "kill -SIGHUP $(pidof dockerd) || systemctl reload docker\n"
+                "sleep 2\n"
+            )
+            runnables.append(setup)
+
         runnable = batch_v1.Runnable()
         runnable.container = batch_v1.Runnable.Container()
         runnable.container.image_uri = base_config.image
         runnable.container.commands = base_config.command
-        
+        if base_config.gpu_count > 0:
+            runnable.container.options = "--runtime=nvidia"
+
         runnable.environment = batch_v1.Environment()
         runnable.environment.variables = base_config.env
-        
-        task_spec.runnables = [runnable]
+
+        runnables.append(runnable)
+        task_spec.runnables = runnables
         
         task_spec.compute_resource = batch_v1.ComputeResource()
         task_spec.compute_resource.cpu_milli = base_config.cpu * 1000
@@ -112,19 +131,34 @@ class GoogleBatch(BatchBackend):
         if base_config.gpu_count > 0 and base_config.gpu_type:
             gpu_map = {
                 "t4": "nvidia-tesla-t4",
-                "v100": "nvidia-tesla-v100", 
+                "v100": "nvidia-tesla-v100",
                 "a100": "nvidia-tesla-a100",
                 "l4": "nvidia-l4",
             }
             gpu_type = gpu_map.get(base_config.gpu_type.lower(), base_config.gpu_type)
-            
+
             accelerator = batch_v1.AllocationPolicy.Accelerator()
             accelerator.type_ = gpu_type
             accelerator.count = base_config.gpu_count
             instance_policy.accelerators = [accelerator]
-        
+
+        # Use Debian instead of COS for GPU jobs.  COS does not expose the
+        # NVIDIA container runtime to Docker, so OpenGL/EGL rendering inside
+        # containers never sees the GPU.  On Debian the batch agent installs
+        # the NVIDIA Container Toolkit which supports --runtime=nvidia.
+        if base_config.gpu_count > 0:
+            boot_disk = batch_v1.AllocationPolicy.Disk()
+            boot_disk.image = "batch-debian"
+            boot_disk.size_gb = 50
+            boot_disk.type_ = "pd-balanced"
+            instance_policy.boot_disk = boot_disk
+
         instance_policy_or_template = batch_v1.AllocationPolicy.InstancePolicyOrTemplate()
         instance_policy_or_template.policy = instance_policy
+
+        # Ensure NVIDIA drivers are installed on the VM when GPUs are requested
+        if base_config.gpu_count > 0 and base_config.gpu_type:
+            instance_policy_or_template.install_gpu_drivers = True
         job.allocation_policy.instances = [instance_policy_or_template]
         
         network_interface = batch_v1.AllocationPolicy.NetworkInterface()
@@ -232,5 +266,5 @@ class GoogleBatch(BatchBackend):
         """Get URL to view logs in Cloud Console."""
         return (
             f"https://console.cloud.google.com/batch/jobsDetail/"
-            f"locations/{self.region}/jobs/{batch_id}?project={self.project}"
+            f"regions/{self.region}/jobs/{batch_id}/logs?project={self.project}"
         )

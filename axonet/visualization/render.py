@@ -18,6 +18,7 @@ Dependencies
 """
 
 from __future__ import annotations
+import logging
 import math
 from dataclasses import dataclass
 from enum import Enum
@@ -26,6 +27,8 @@ from typing import Dict, Optional, Tuple, Union
 
 import numpy as np
 import moderngl
+
+logger = logging.getLogger(__name__)
 
 from .mesh import MeshRenderer
 from ..io import load_swc, NeuronClass
@@ -47,7 +50,10 @@ COLORS = {
 
 def majority_pool_uint8(mask_hi: np.ndarray, factor: int, *, prefer_nonzero: bool = True) -> np.ndarray:
     """Downsample (H*factor, W*factor) -> (H, W) by majority voting within each factor×factor block.
-    Vectorized implementation.
+
+    When prefer_nonzero=True, voting is restricted to non-zero values so that
+    background pixels at structure edges don't outvote foreground.  Returns 0
+    only when every sample in the block is 0.
     """
     Hh, Wh = mask_hi.shape
     assert Hh % factor == 0 and Wh % factor == 0, f"Supersample factor {factor} must divide image size ({Hh}, {Wh})"
@@ -55,7 +61,18 @@ def majority_pool_uint8(mask_hi: np.ndarray, factor: int, *, prefer_nonzero: boo
     blocks = mask_hi.reshape(H, factor, W, factor).transpose(0, 2, 1, 3).reshape(H, W, -1)
 
     if prefer_nonzero:
-        return blocks.max(axis=2).astype(np.uint8)
+        result = np.zeros((H, W), dtype=np.uint8)
+        unique_nonzero = np.unique(mask_hi)
+        unique_nonzero = unique_nonzero[unique_nonzero > 0]
+        if len(unique_nonzero) == 0:
+            return result
+        best_count = np.zeros((H, W), dtype=np.int32)
+        for val in unique_nonzero:
+            count = (blocks == val).sum(axis=2)
+            better = count > best_count
+            result[better] = val
+            best_count[better] = count[better]
+        return result
     else:
         from scipy.stats import mode
         result, _ = mode(blocks, axis=2, keepdims=False)
@@ -179,9 +196,25 @@ void main(){
 }
 """
 
+VERT_SRC_DEPTH = """
+#version 330 core
+in vec3 in_position;
+
+uniform mat4 u_mvp;
+uniform mat4 u_mv;
+
+out float v_viewz;
+
+void main(){
+    vec4 viewpos = u_mv * vec4(in_position, 1.0);
+    v_viewz = viewpos.z;
+    gl_Position = u_mvp * vec4(in_position, 1.0);
+}
+"""
+
 FRAG_SRC_DEPTH = """
 #version 330 core
-flat in float v_viewz;
+in float v_viewz;
 
 uniform float u_depth_near;
 uniform float u_depth_far;
@@ -272,15 +305,42 @@ class OffscreenContext:
         self.ctx.enable(moderngl.CULL_FACE)
 
     def _create_context(self):
-        """Create OpenGL context, trying EGL first for headless environments."""
+        """Create OpenGL context, trying EGL first then default backend."""
+        import os
+
+        errors = []
+
         # Try EGL backend first (works in headless/container environments)
         try:
-            return moderngl.create_standalone_context(require=330, backend='egl')
-        except Exception:
-            pass
-        
-        # Fall back to default backend (requires X11 display)
-        return moderngl.create_standalone_context(require=330)
+            ctx = moderngl.create_standalone_context(require=330, backend='egl')
+            logger.info("OpenGL context created with EGL backend: %s", ctx.info.get("GL_RENDERER", "unknown"))
+            return ctx
+        except Exception as exc:
+            errors.append(f"EGL: {exc}")
+            logger.warning("EGL backend failed: %s", exc)
+
+        # Try default backend (X11/GLX on Linux, CGL on macOS)
+        try:
+            ctx = moderngl.create_standalone_context(require=330)
+            logger.info("OpenGL context created with default backend: %s", ctx.info.get("GL_RENDERER", "unknown"))
+            return ctx
+        except Exception as exc:
+            errors.append(f"default: {exc}")
+            logger.warning("Default backend failed: %s", exc)
+
+        # Both failed — build a diagnostic message
+        diag = [
+            f"DISPLAY={os.environ.get('DISPLAY', '(not set)')}",
+            f"NVIDIA_VISIBLE_DEVICES={os.environ.get('NVIDIA_VISIBLE_DEVICES', '(not set)')}",
+            f"NVIDIA_DRIVER_CAPABILITIES={os.environ.get('NVIDIA_DRIVER_CAPABILITIES', '(not set)')}",
+            f"__EGL_VENDOR_LIBRARY_DIRS={os.environ.get('__EGL_VENDOR_LIBRARY_DIRS', '(not set)')}",
+        ]
+        raise RuntimeError(
+            f"Cannot create OpenGL context.\n"
+            f"  Errors: {'; '.join(errors)}\n"
+            f"  Env: {', '.join(diag)}\n"
+            f"  Tip: Run scripts/diagnose_egl.py inside the container for full diagnostics."
+        )
 
     def close(self):
         if self.ctx:
@@ -302,7 +362,7 @@ class NeuroRenderCore:
         self.gl = ctx.ctx
 
         self.prog_rgba = self.gl.program(vertex_shader=VERT_SRC, fragment_shader=FRAG_SRC_RGBA)
-        self.prog_depth = self.gl.program(vertex_shader=VERT_SRC, fragment_shader=FRAG_SRC_DEPTH)
+        self.prog_depth = self.gl.program(vertex_shader=VERT_SRC_DEPTH, fragment_shader=FRAG_SRC_DEPTH)
         self.prog_integer = self.gl.program(vertex_shader=VERT_SRC_SIMPLE, fragment_shader=FRAG_SRC_INTEGER)
 
         self.vbo: Optional[moderngl.Buffer] = None
@@ -721,6 +781,7 @@ class NeuroRenderCore:
         self.gl.enable(moderngl.CULL_FACE)
         self.aspect = prev_aspect
 
+        self.gl.finish()
         data = fbo.color_attachments[0].read()
         depth_hi = np.frombuffer(data, dtype=np.float32).reshape(Hhi, Whi)
         depth_hi = np.flipud(depth_hi)
@@ -762,6 +823,7 @@ class NeuroRenderCore:
         self.gl.enable(moderngl.CULL_FACE)
         self.aspect = prev_aspect
 
+        self.gl.finish()
         data = fbo.color_attachments[0].read()
         mask_hi = np.frombuffer(data, dtype=np.uint8).reshape(Hhi, Whi)
         mask_hi = np.flipud(mask_hi)

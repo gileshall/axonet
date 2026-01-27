@@ -32,6 +32,12 @@ env
 *.onnx.data
 training/
 probing_results/
+*morph*/
+eval/
+checkpoints/
+*annotations*/
+tarpit/
+allen*/
 
 # Notebooks
 notebooks/
