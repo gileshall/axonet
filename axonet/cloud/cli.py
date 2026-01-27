@@ -79,44 +79,43 @@ def cmd_generate_dataset(args):
     # Pass GCP environment variables to container
     env = _get_gcp_env()
     
+    # Build command args once - Google Batch sets BATCH_TASK_INDEX per task
+    cmd_args = [
+        "--manifest", manifest_arg,
+        "--swc-prefix", args.swc_prefix,
+        "--output", args.output,
+        "--width", str(args.width),
+        "--height", str(args.height),
+        "--views", str(args.views),
+        "--segments", str(args.segments),
+        "--supersample-factor", str(args.supersample_factor),
+        "--margin", str(args.margin),
+        "--projection", args.projection,
+        "--fovy", str(args.fovy),
+        "--min-qc", str(args.min_qc),
+        "--qc-retries", str(args.qc_retries),
+        "--radius-scale", str(args.radius_scale),
+        "--radius-adaptive-alpha", str(args.radius_adaptive_alpha),
+        "--radius-ref-percentile", str(args.radius_ref_percentile),
+        "--seed", str(args.seed),
+        "--bg", *[str(c) for c in args.bg],
+        "--total-tasks", str(num_tasks),
+        "--provider", args.provider,
+        "--sampling", args.sampling,
+    ]
+    if args.depth_shading:
+        cmd_args.append("--depth-shading")
+    if args.adaptive_framing:
+        cmd_args.append("--adaptive-framing")
+    if args.auto_margin and not args.no_auto_margin:
+        cmd_args.append("--auto-margin")
+    if args.no_cache:
+        cmd_args.append("--no-cache")
+    if args.save_cache:
+        cmd_args.append("--save-cache")
+
     configs = []
     for i in range(num_tasks):
-        # Only pass arguments - the container ENTRYPOINT handles the python command
-        cmd_args = [
-            "--manifest", manifest_arg,
-            "--swc-prefix", args.swc_prefix,
-            "--output", args.output,
-            "--width", str(args.width),
-            "--height", str(args.height),
-            "--views", str(args.views),
-            "--segments", str(args.segments),
-            "--supersample-factor", str(args.supersample_factor),
-            "--margin", str(args.margin),
-            "--projection", args.projection,
-            "--fovy", str(args.fovy),
-            "--min-qc", str(args.min_qc),
-            "--qc-retries", str(args.qc_retries),
-            "--radius-scale", str(args.radius_scale),
-            "--radius-adaptive-alpha", str(args.radius_adaptive_alpha),
-            "--radius-ref-percentile", str(args.radius_ref_percentile),
-            "--seed", str(args.seed),
-            "--bg", *[str(c) for c in args.bg],
-            "--task-index", str(i),
-            "--total-tasks", str(num_tasks),
-            "--provider", args.provider,
-            "--sampling", args.sampling,
-        ]
-        if args.depth_shading:
-            cmd_args.append("--depth-shading")
-        if args.adaptive_framing:
-            cmd_args.append("--adaptive-framing")
-        if args.auto_margin and not args.no_auto_margin:
-            cmd_args.append("--auto-margin")
-        if args.no_cache:
-            cmd_args.append("--no-cache")
-        if args.save_cache:
-            cmd_args.append("--save-cache")
-        
         config = JobConfig(
             name=f"dataset-gen-{i}",
             command=cmd_args,
@@ -142,14 +141,44 @@ def cmd_generate_dataset(args):
     if args.wait:
         print("Waiting for completion...")
         results = provider.batch.wait(batch_id)
-        
+
         succeeded = sum(1 for r in results.values() if r.status == JobStatus.SUCCEEDED)
         failed = sum(1 for r in results.values() if r.status == JobStatus.FAILED)
-        
+
         print(f"Completed: {succeeded} succeeded, {failed} failed")
-        
+
         if failed > 0:
             sys.exit(1)
+
+        # Merge per-task manifests into a single manifest_train.jsonl
+        print("Merging per-task manifests...")
+        merged_entries = []
+        for i in range(num_tasks):
+            part_path = f"{args.output.rstrip('/')}/manifests/manifest_{i}.jsonl"
+            try:
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False) as tmp:
+                    tmp_path = tmp.name
+                provider.storage.download(part_path, Path(tmp_path))
+                with open(tmp_path) as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            merged_entries.append(line)
+                os.unlink(tmp_path)
+            except Exception as e:
+                print(f"Warning: could not download manifest part {i}: {e}")
+
+        if merged_entries:
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False) as f:
+                for entry in merged_entries:
+                    f.write(entry + "\n")
+                tmp_manifest = f.name
+            remote_manifest_train = f"{args.output.rstrip('/')}/manifest_train.jsonl"
+            provider.storage.upload(Path(tmp_manifest), remote_manifest_train)
+            os.unlink(tmp_manifest)
+            print(f"Merged {len(merged_entries)} entries into {remote_manifest_train}")
+        else:
+            print("Warning: no manifest entries found to merge")
 
 
 def cmd_train(args):
