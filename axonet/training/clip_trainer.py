@@ -26,7 +26,6 @@ from pytorch_lightning.callbacks import (
 from pytorch_lightning.loggers import TensorBoardLogger, WandbLogger
 from torch.utils.data import DataLoader
 
-from ..config import ExperimentConfig
 from ..data.metadata_adapters import get_adapter
 from ..models.clip_modules import SegVAE2D_CLIP
 from ..models.d3_swc_vae import load_model
@@ -340,66 +339,6 @@ class CLIPDataModule(LightningDataModule):
         )
 
 
-def train_from_config(config: ExperimentConfig):
-    """Train CLIP model from experiment config."""
-    clip_cfg = config.training.clip
-
-    model = CLIPLightning(
-        stage1_checkpoint=clip_cfg.stage1_checkpoint,
-        clip_embed_dim=clip_cfg.embed_dim,
-        hidden_dim=clip_cfg.hidden_dim,
-        freeze_encoder=clip_cfg.freeze_encoder,
-        encoder_lr_mult=clip_cfg.encoder_lr_mult,
-        lr=config.training.lr,
-        temperature=clip_cfg.temperature,
-        learnable_temperature=clip_cfg.learnable_temperature,
-        lambda_clip=clip_cfg.lambda_clip,
-        lambda_kld=clip_cfg.lambda_kld,
-        text_encoder_name=clip_cfg.text_encoder,
-    )
-
-    data_root = Path(config.data.root)
-    datamodule = CLIPDataModule(
-        data_root=data_root,
-        manifest_train=data_root / config.data.manifest,
-        metadata_path=data_root / config.data.metadata if config.data.metadata else None,
-        source=config.data.source,
-        id_column=config.data.id_column,
-        batch_size=config.training.batch_size,
-        num_workers=config.training.num_workers,
-    )
-
-    callbacks = [
-        ModelCheckpoint(
-            dirpath=config.output.save_dir,
-            filename="clip-{epoch:02d}-{val_loss:.4f}",
-            save_top_k=config.output.save_top_k,
-            monitor=config.output.monitor,
-            mode="min",
-        ),
-        LearningRateMonitor(logging_interval="step"),
-    ]
-
-    tb_logger = TensorBoardLogger(
-        save_dir=config.output.log_dir,
-        name=config.name,
-    )
-
-    trainer = Trainer(
-        max_epochs=config.training.max_epochs,
-        accelerator="auto",
-        devices="auto",
-        precision=config.training.precision,
-        gradient_clip_val=config.training.gradient_clip_val,
-        callbacks=callbacks,
-        logger=tb_logger,
-    )
-
-    trainer.fit(model, datamodule)
-
-    return model
-
-
 def auto_detect_manifests(data_dir: Path) -> Dict[str, Optional[Path]]:
     """Auto-detect manifest files in data directory."""
     manifests = {
@@ -513,9 +452,6 @@ def main():
         description="Stage 2 CLIP fine-tuning",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-
-    # Config file option
-    parser.add_argument("--config", type=Path, help="YAML config file (overrides CLI args)")
 
     # Data arguments
     data_group = parser.add_argument_group("Data")
@@ -690,12 +626,6 @@ def main():
     )
 
     args = parser.parse_args()
-
-    # Handle YAML config
-    if args.config:
-        config = ExperimentConfig.from_yaml(args.config)
-        train_from_config(config)
-        return
 
     # Set seed for reproducibility
     if args.seed is not None:

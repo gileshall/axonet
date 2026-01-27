@@ -12,7 +12,7 @@ This library provides tools for:
 from .core import Neuron, SWCNode
 from .io import load_swc
 from .analysis import MorphologyAnalyzer
-from .visualization import MeshRenderer, ANSIRenderer
+from .visualization import MeshRenderer
 from . import training
 
 __version__ = "0.1.0"
@@ -20,10 +20,9 @@ __author__ = "Axonet Team"
 
 __all__ = [
     "Neuron",
-    "SWCNode", 
+    "SWCNode",
     "load_swc",
     "MorphologyAnalyzer",
     "MeshRenderer",
-    "ANSIRenderer",
     "training",
 ]
