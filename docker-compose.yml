@@ -75,6 +75,15 @@ services:
       --provider local
       --precision bf16
 
+  # Quick EGL/OpenGL diagnostic (no full rebuild needed)
+  egl-test:
+    build:
+      context: .
+      target: deps
+    volumes:
+      - ./scripts/diagnose_egl.py:/tmp/diagnose_egl.py:ro
+    command: ["python", "/tmp/diagnose_egl.py"]
+
 volumes:
   axonet-data:
   axonet-cache:

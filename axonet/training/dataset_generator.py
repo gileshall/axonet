@@ -112,7 +112,7 @@ def render_with_masks(
     sampling: str,
     auto_margin: bool,
     seed: int | None,
-    supersample_factor: int = 2,
+    supersample_factor: int = 4,
     cache: bool = True,
     cache_dir: Path | None = None,
     adaptive_framing: bool = False,
@@ -349,7 +349,7 @@ def main():
     p.add_argument("--biased-views", type=int, default=12, help="PCA biased views near PC1-PC2 plane")
     p.add_argument("--random-views", type=int, default=6, help="Random views for diversity")
     p.add_argument("--seed", type=int, default=1234)
-    p.add_argument("--supersample-factor", type=int, default=2, help="Supersampling factor for depth and mask rendering (2, 3, or 4 recommended)")
+    p.add_argument("--supersample-factor", type=int, default=4, help="Supersampling factor for depth and mask rendering (2, 3, or 4 recommended)")
     p.add_argument("-j", "--jobs", type=int, default=1, help="Number of parallel jobs (1 = sequential)")
     
     p.add_argument("--val-ratio", type=float, default=0.0, help="Validation set ratio (0.0 = no validation set, default: 0.0)")

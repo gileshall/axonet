@@ -807,6 +807,18 @@ def main():
             )
         )
 
+    if args.manifest_val:
+        from .callbacks import ValidationImageLogger
+
+        callbacks.append(
+            ValidationImageLogger(
+                manifest_path=args.manifest_val,
+                data_root=args.data_dir,
+                num_samples=3,
+                image_size=image_size or 512,
+            )
+        )
+
     # Setup loggers
     loggers = []
     if args.log_dir:

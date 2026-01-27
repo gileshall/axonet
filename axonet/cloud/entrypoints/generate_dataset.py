@@ -63,6 +63,30 @@ def download_inputs(
     return swc_dir
 
 
+def _render_one(args_tuple):
+    """Worker function for multiprocessing."""
+    entry, output_dir, render_kwargs = args_tuple
+    from axonet.training.dataset_generator import render_with_masks
+
+    swc_path = Path(entry.get("local_swc") or entry.get("swc") or entry.get("path"))
+    if not swc_path.exists():
+        return []
+
+    neuron_id = entry.get("neuron_id") or swc_path.stem
+    _, render_entries = render_with_masks(
+        swc_path=swc_path,
+        out_dir=output_dir,
+        root_dir=output_dir,
+        **render_kwargs,
+    )
+
+    for re in render_entries:
+        re["neuron_id"] = neuron_id
+        if "neuron_name" in entry:
+            re["neuron_name"] = entry["neuron_name"]
+    return render_entries
+
+
 def generate_renders(
     entries: List[dict],
     output_dir: Path,
@@ -86,56 +110,42 @@ def generate_renders(
     radius_adaptive_alpha: float = 0.0,
     radius_ref_percentile: float = 50.0,
     seed: int | None = 1234,
+    jobs: int = 1,
 ):
     """Generate rendered views for each neuron."""
-    from axonet.training.dataset_generator import render_with_masks
+    import multiprocessing
 
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    render_kwargs = dict(
+        views=views, width=width, height=height, segments=segments,
+        radius_scale=radius_scale, radius_adaptive_alpha=radius_adaptive_alpha,
+        radius_ref_percentile=radius_ref_percentile, projection=projection,
+        fovy=fovy, margin=margin, depth_shading=depth_shading,
+        background=background, min_qc=min_qc, qc_retries=qc_retries,
+        sampling=sampling, auto_margin=auto_margin, seed=seed,
+        supersample_factor=supersample_factor, cache=cache, cache_dir=None,
+        adaptive_framing=adaptive_framing,
+    )
+
+    tasks = [(entry, output_dir, render_kwargs) for entry in entries]
+
     manifest_entries = []
+    if jobs > 1:
+        logger.info(f"Rendering with {jobs} parallel workers")
+        with multiprocessing.Pool(jobs) as pool:
+            for result in pool.imap_unordered(_render_one, tasks):
+                manifest_entries.extend(result)
+                logger.info(f"  completed {len(manifest_entries)} render entries")
+    else:
+        for task in tasks:
+            entry = task[0]
+            neuron_id = entry.get("neuron_id") or Path(
+                entry.get("local_swc") or entry.get("swc") or entry.get("path")
+            ).stem
+            logger.info(f"Processing: {neuron_id}")
+            manifest_entries.extend(_render_one(task))
 
-    for entry in entries:
-        swc_path = Path(entry.get("local_swc") or entry.get("swc") or entry.get("path"))
-        if not swc_path.exists():
-            logger.warning(f"SWC not found: {swc_path}")
-            continue
-
-        neuron_id = entry.get("neuron_id") or swc_path.stem
-
-        logger.info(f"Processing: {neuron_id}")
-
-        neuron_out_dir, render_entries = render_with_masks(
-            swc_path=swc_path,
-            out_dir=output_dir,
-            root_dir=output_dir,
-            views=views,
-            width=width,
-            height=height,
-            segments=segments,
-            radius_scale=radius_scale,
-            radius_adaptive_alpha=radius_adaptive_alpha,
-            radius_ref_percentile=radius_ref_percentile,
-            projection=projection,
-            fovy=fovy,
-            margin=margin,
-            depth_shading=depth_shading,
-            background=background,
-            min_qc=min_qc,
-            qc_retries=qc_retries,
-            sampling=sampling,
-            auto_margin=auto_margin,
-            seed=seed,
-            supersample_factor=supersample_factor,
-            cache=cache,
-            cache_dir=None,
-            adaptive_framing=adaptive_framing,
-        )
-        
-        for re in render_entries:
-            re["neuron_id"] = neuron_id
-            if "neuron_name" in entry:
-                re["neuron_name"] = entry["neuron_name"]
-            manifest_entries.append(re)
-    
     return manifest_entries
 
 
@@ -197,6 +207,7 @@ def main():
     parser.add_argument("--adaptive-framing", action="store_true")
     parser.add_argument("--no-adaptive-framing", action="store_true", help="Disable adaptive framing")
     parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("-j", "--jobs", type=int, default=1, help="Parallel render workers (1 = sequential)")
     parser.add_argument("--no-cache", action="store_true")
     parser.add_argument("--save-cache", action="store_true", help="Upload mesh cache with outputs")
     parser.add_argument("--task-index", type=int, default=None, help="Task index (or BATCH_TASK_INDEX)")
@@ -269,6 +280,7 @@ def main():
         radius_adaptive_alpha=args.radius_adaptive_alpha,
         radius_ref_percentile=args.radius_ref_percentile,
         seed=args.seed,
+        jobs=args.jobs,
     )
     
     logger.info(f"Generated {len(manifest_entries)} render entries")
