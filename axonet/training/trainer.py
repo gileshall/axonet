@@ -849,7 +849,7 @@ def main():
         "log_every_n_steps": args.log_every_n_steps,
         "val_check_interval": args.val_check_interval,
         "accumulate_grad_batches": args.gradient_accumulation_steps,
-        "deterministic": args.seed is not None,
+        "deterministic": "warn_only" if args.seed is not None else False,
     }
 
     if args.gradient_clip_val > 0:
