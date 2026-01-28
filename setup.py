@@ -53,7 +53,8 @@ setup(
             "google-cloud-compute",
         ],
         "clip": [
-            "sentence-transformers",
+            "transformers>=4.30.0",
+            "tokenizers",
         ],
     },
     entry_points={

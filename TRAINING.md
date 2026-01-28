@@ -260,7 +260,7 @@ python -m axonet.training.clip_trainer \
     --clip-embed-dim 512 \
     --temperature 0.07 \
     --learnable-temperature \
-    --text-encoder distilbert-base-uncased \
+    --text-encoder allenai/scibert_scivocab_uncased \
     --freeze-encoder \
     --max-epochs 50 \
     --lr 1e-4 \
@@ -289,7 +289,7 @@ This curriculum helps the model learn hierarchical semantic relationships.
 | `--clip-embed-dim` | 512 | CLIP embedding dimension |
 | `--temperature` | 0.07 | InfoNCE temperature |
 | `--learnable-temperature` | off | Make temperature learnable |
-| `--text-encoder` | `distilbert-base-uncased` | Text encoder model |
+| `--text-encoder` | `allenai/scibert_scivocab_uncased` | Text encoder model (scibert recommended for neuroscience) |
 | `--freeze-encoder` | off | Freeze VAE encoder (train projection only) |
 | `--encoder-lr-mult` | 0.1 | LR multiplier for encoder (if not frozen) |
 | `--lambda-clip` | 1.0 | Contrastive loss weight |
@@ -416,14 +416,6 @@ axonet-cloud train \
 docker build --target dataset -t axonet:dataset .
 docker build --target train -t axonet:train .
 ```
-
-## Reference Configurations
-
-Example configurations are in `configs/`:
-- `stage1_neuromorpho.yaml` - Stage 1 settings
-- `stage2_allen_clip.yaml` - Stage 2 settings
-
-These are documentation/reference only; the actual training is CLI-driven.
 
 ## References
 

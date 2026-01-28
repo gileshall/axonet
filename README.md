@@ -109,7 +109,7 @@ pip install -e .
 # With visualization tools (pyglet viewer, plotly)
 pip install -e ".[viz]"
 
-# With CLIP text encoders (sentence-transformers)
+# With CLIP text encoders (HuggingFace transformers)
 pip install -e ".[clip]"
 
 # With cloud training support (Google Cloud)
@@ -219,7 +219,7 @@ python -m axonet.training.clip_trainer \
     --clip-embed-dim 512 \
     --temperature 0.07 \
     --learnable-temperature \
-    --text-encoder distilbert-base-uncased \
+    --text-encoder allenai/scibert_scivocab_uncased \
     --max-epochs 50 \
     --save-dir checkpoints/clip \
     --log-dir logs/clip
@@ -249,7 +249,7 @@ axonet/
 ├── models/
 │   ├── d3_swc_vae.py       # SegVAE2D: U-Net + variational skip connections
 │   ├── clip_modules.py     # CLIP projection heads
-│   └── text_encoders.py    # Hash and sentence-transformer encoders
+│   └── text_encoders.py    # Hash and HuggingFace transformer encoders
 ├── training/
 │   ├── trainer.py          # Stage 1: VAE training (PyTorch Lightning)
 │   ├── clip_trainer.py     # Stage 2: CLIP fine-tuning
