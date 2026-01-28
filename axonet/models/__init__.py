@@ -12,7 +12,8 @@ from .clip_modules import (
 )
 from .text_encoders import (
     TextEncoderBase,
-    SentenceTransformerEncoder,
+    TransformerTextEncoder,
+    HashTextEncoder,
     TextProjectionHead,
     ProjectedTextEncoder,
 )
@@ -25,7 +26,8 @@ __all__ = [
     "CLIPProjectionHead",
     "SegVAE2D_CLIP",
     "TextEncoderBase",
-    "SentenceTransformerEncoder",
+    "TransformerTextEncoder",
+    "HashTextEncoder",
     "TextProjectionHead",
     "ProjectedTextEncoder",
 ]
