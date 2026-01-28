@@ -306,10 +306,11 @@ Two options:
    - Deterministic, fast
    - Good for debugging
 
-2. **SentenceTransformerEncoder**: Semantic understanding
-   - Uses `sentence-transformers` library
-   - Pre-trained on large text corpora
-   - Better text-image alignment
+2. **TransformerTextEncoder**: Semantic understanding via HuggingFace
+   - Uses HuggingFace `transformers` library directly
+   - Default: `allenai/scibert_scivocab_uncased` (trained on scientific papers)
+   - Also supports: `microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract` (biomedical),
+     `distilbert-base-uncased` (general purpose)
 
 ### InfoNCE Loss (`training/losses/infonce.py`)
 

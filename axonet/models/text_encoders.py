@@ -120,16 +120,15 @@ class TransformerTextEncoder(TextEncoderBase, nn.Module):
 
     Uses mean pooling over token embeddings for sentence representation.
 
-    Recommended models:
-    - "bert-base-uncased" (110M params, 768-dim)
-    - "distilbert-base-uncased" (66M params, 768-dim, faster)
-    - "sentence-transformers/all-MiniLM-L6-v2" (22M params, 384-dim)
-    - "prajjwal1/bert-tiny" (4M params, 128-dim, very fast)
+    Recommended models for neuroscience text:
+        - "allenai/scibert_scivocab_uncased" (110M, 768-dim) - scientific papers, default
+        - "microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract" (110M, 768-dim) - biomedical
+        - "distilbert-base-uncased" (66M, 768-dim) - general purpose, faster
     """
 
     def __init__(
         self,
-        model_name: str = "distilbert-base-uncased",
+        model_name: str = "allenai/scibert_scivocab_uncased",
         device: Optional[str] = None,
         normalize: bool = True,
         max_length: int = 128,
@@ -194,10 +193,6 @@ class TransformerTextEncoder(TextEncoderBase, nn.Module):
             embeddings = F.normalize(embeddings, p=2, dim=-1)
 
         return embeddings
-
-
-# Alias for backwards compatibility
-SentenceTransformerEncoder = TransformerTextEncoder
 
 
 class TextProjectionHead(nn.Module):

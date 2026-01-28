@@ -52,7 +52,7 @@ class CLIPLightning(LightningModule):
         learnable_temperature: bool = True,
         lambda_clip: float = 1.0,
         lambda_kld: float = 0.0,
-        text_encoder_name: str = "distilbert-base-uncased",
+        text_encoder_name: str = "allenai/scibert_scivocab_uncased",
         lr_scheduler: str = "cosine",
         lr_warmup_steps: int = 0,
         lr_t_max: Optional[int] = None,
@@ -506,8 +506,10 @@ def main():
     )
     model_group.add_argument(
         "--text-encoder", type=str,
-        default="distilbert-base-uncased",
-        help="Text encoder: HuggingFace model name (e.g., distilbert-base-uncased)"
+        default="allenai/scibert_scivocab_uncased",
+        help="Text encoder model. Recommended: allenai/scibert_scivocab_uncased (scientific), "
+             "microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract (biomedical), "
+             "distilbert-base-uncased (general). Use 'hash' or 'hash:DIM' for lightweight option."
     )
 
     # CLIP loss arguments

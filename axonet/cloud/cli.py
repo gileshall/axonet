@@ -205,10 +205,6 @@ def cmd_train(args):
         "--provider", args.provider,
     ]
     
-    if args.config:
-        provider.storage.upload(Path(args.config), f"{args.output.rstrip('/')}/config.yaml")
-        command.extend(["--config", f"{args.output.rstrip('/')}/config.yaml"])
-    
     if args.stage == 2:
         if not args.stage1_checkpoint:
             print("ERROR: --stage1-checkpoint required for Stage 2")
@@ -356,7 +352,6 @@ def main():
     gen_parser.set_defaults(func=cmd_generate_dataset)
     
     train_parser = subparsers.add_parser("train", help="Train model")
-    train_parser.add_argument("--config", type=Path, help="Config YAML")
     train_parser.add_argument("--stage", type=int, choices=[1, 2], default=1)
     train_parser.add_argument("--data-dir", required=True, help="Dataset location")
     train_parser.add_argument("--manifest", default="manifest.jsonl")

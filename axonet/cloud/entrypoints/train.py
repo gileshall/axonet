@@ -6,9 +6,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import shutil
 from pathlib import Path
-from typing import Optional
 
 logging.basicConfig(
     level=logging.INFO,
@@ -65,7 +63,6 @@ def upload_checkpoints(storage, local_dir: Path, remote_prefix: str):
 
 
 def train_stage1(
-    config_path: Optional[Path],
     data_dir: Path,
     manifest: str,
     output_dir: Path,
@@ -74,27 +71,23 @@ def train_stage1(
     """Run Stage 1 VAE training."""
     from axonet.training.trainer import main as trainer_main
     import sys
-    
+
     args = [
         "--data-dir", str(data_dir),
         "--manifest-train", manifest,
         "--save-dir", str(output_dir / "checkpoints"),
         "--log-dir", str(output_dir / "logs"),
     ]
-    
-    if config_path:
-        args = ["--config", str(config_path)] + args
-    
+
     for k, v in kwargs.items():
         if v is not None:
             args.extend([f"--{k.replace('_', '-')}", str(v)])
-    
+
     sys.argv = ["trainer"] + args
     trainer_main()
 
 
 def train_stage2(
-    config_path: Optional[Path],
     data_dir: Path,
     manifest: str,
     metadata: str,
@@ -105,7 +98,7 @@ def train_stage2(
     """Run Stage 2 CLIP training."""
     from axonet.training.clip_trainer import main as clip_main
     import sys
-    
+
     args = [
         "--data-dir", str(data_dir),
         "--manifest-train", manifest,
@@ -114,21 +107,17 @@ def train_stage2(
         "--save-dir", str(output_dir / "checkpoints"),
         "--log-dir", str(output_dir / "logs"),
     ]
-    
-    if config_path:
-        args = ["--config", str(config_path)] + args
-    
+
     for k, v in kwargs.items():
         if v is not None:
             args.extend([f"--{k.replace('_', '-')}", str(v)])
-    
+
     sys.argv = ["clip_trainer"] + args
     clip_main()
 
 
 def main():
     parser = argparse.ArgumentParser(description="Train axonet models")
-    parser.add_argument("--config", type=Path, help="Config YAML file")
     parser.add_argument("--stage", type=int, choices=[1, 2], default=1, help="Training stage")
     
     parser.add_argument("--data-dir", required=True, help="Dataset location (local or gs://)")
@@ -195,7 +184,6 @@ def main():
     
     if args.stage == 1:
         train_stage1(
-            config_path=args.config,
             data_dir=data_dir,
             manifest=args.manifest,
             output_dir=output_dir,
@@ -203,7 +191,6 @@ def main():
         )
     else:
         train_stage2(
-            config_path=args.config,
             data_dir=data_dir,
             manifest=args.manifest,
             metadata=args.metadata,
