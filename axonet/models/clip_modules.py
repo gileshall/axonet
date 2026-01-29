@@ -38,32 +38,38 @@ class CLIPProjectionHead(nn.Module):
 
 class SegVAE2D_CLIP(nn.Module):
     """Extends SegVAE2D with CLIP projection head for contrastive learning.
-    
+
     Wraps the base VAE encoder and adds a projection head that maps
     the bottleneck mu to CLIP embedding space.
     """
 
     def __init__(
         self,
-        base_model: SegVAE2D,
+        base_model: Optional[SegVAE2D] = None,
         clip_embed_dim: int = 512,
         hidden_dim: int = 256,
         dropout: float = 0.1,
         freeze_encoder: bool = True,
+        latent_channels: int = 128,  # Default if no base_model provided
     ):
         super().__init__()
-        self.base_model = base_model
         self.freeze_encoder = freeze_encoder
 
-        # Infer latent_channels from the mu layer output channels
-        latent_channels = base_model.mu.out_channels
+        if base_model is not None:
+            self.base_model = base_model
+            # Infer latent_channels from the mu layer output channels
+            latent_channels = base_model.mu.out_channels
+        else:
+            # Create default base model (weights will be loaded from checkpoint)
+            self.base_model = SegVAE2D(latent_channels=latent_channels)
+
         self.image_proj = CLIPProjectionHead(
             input_dim=latent_channels,
             hidden_dim=hidden_dim,
             output_dim=clip_embed_dim,
             dropout=dropout,
         )
-        
+
         if freeze_encoder:
             self._freeze_encoder()
 

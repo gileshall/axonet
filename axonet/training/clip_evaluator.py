@@ -39,37 +39,47 @@ from .clip_trainer import CLIPLightning
 # Model loading & embedding computation
 # ---------------------------------------------------------------------------
 
-def load_clip_model(checkpoint_path: Path, device: str = "cpu") -> CLIPLightning:
+def load_clip_model(
+    checkpoint_path: Path,
+    device: str = "cpu",
+    stage1_checkpoint: Optional[Path] = None,
+) -> CLIPLightning:
     """Load trained CLIP model from checkpoint.
 
     Handles checkpoints saved with torch.compile() by stripping '_orig_mod.' prefix.
+    Allows overriding the stage1_checkpoint path stored in the checkpoint.
     """
     # Load checkpoint to check for compiled model state
     checkpoint = torch.load(checkpoint_path, map_location=device)
 
     # Check if state dict has _orig_mod. prefix (from torch.compile)
+    needs_rewrite = False
     if "state_dict" in checkpoint:
         state_dict = checkpoint["state_dict"]
         if any(k.startswith("image_encoder._orig_mod.") for k in state_dict.keys()):
             print("Detected torch.compile checkpoint, stripping '_orig_mod.' prefix...")
             new_state_dict = {}
             for k, v in state_dict.items():
-                # Strip _orig_mod. from image_encoder keys
                 if "._orig_mod." in k:
                     new_k = k.replace("._orig_mod.", ".")
                     new_state_dict[new_k] = v
                 else:
                     new_state_dict[k] = v
             checkpoint["state_dict"] = new_state_dict
-            # Save modified checkpoint to temp location and load from there
-            with tempfile.NamedTemporaryFile(suffix=".ckpt", delete=False) as f:
-                torch.save(checkpoint, f.name)
-                model = CLIPLightning.load_from_checkpoint(f.name, map_location=device)
-                os.unlink(f.name)
-        else:
-            model = CLIPLightning.load_from_checkpoint(str(checkpoint_path), map_location=device)
+            needs_rewrite = True
+
+    # Override stage1_checkpoint in hyperparameters if provided
+    load_kwargs = {"map_location": device}
+    if stage1_checkpoint is not None:
+        load_kwargs["stage1_checkpoint"] = str(stage1_checkpoint)
+
+    if needs_rewrite:
+        with tempfile.NamedTemporaryFile(suffix=".ckpt", delete=False) as f:
+            torch.save(checkpoint, f.name)
+            model = CLIPLightning.load_from_checkpoint(f.name, **load_kwargs)
+            os.unlink(f.name)
     else:
-        model = CLIPLightning.load_from_checkpoint(str(checkpoint_path), map_location=device)
+        model = CLIPLightning.load_from_checkpoint(str(checkpoint_path), **load_kwargs)
 
     model.eval()
     model.to(device)
@@ -638,7 +648,7 @@ def create_tsne_visualization(
     max_samples: int = 2000,
     perplexity: int = 30,
 ):
-    """Create t-SNE visualization of neuron embeddings."""
+    """Create t-SNE visualization of neuron embeddings using colored shapes."""
     n = len(labels)
     if n > max_samples:
         indices = np.random.choice(n, max_samples, replace=False)
@@ -651,22 +661,42 @@ def create_tsne_visualization(
 
     fig, ax = plt.subplots(figsize=(12, 10))
     unique_labels = sorted(set(labels))
-    cmap = plt.cm.get_cmap("tab10" if len(unique_labels) <= 10 else "tab20")
-    label_to_color = {l: cmap(i % 20) for i, l in enumerate(unique_labels)}
 
-    for label in unique_labels:
+    # High-contrast colors (colorblind-friendly)
+    colors = [
+        "#e41a1c",  # red
+        "#377eb8",  # blue
+        "#4daf4a",  # green
+        "#984ea3",  # purple
+        "#ff7f00",  # orange
+        "#a65628",  # brown
+        "#f781bf",  # pink
+        "#999999",  # gray
+        "#00ced1",  # dark cyan
+        "#ffd700",  # gold
+    ]
+
+    # Distinct marker shapes
+    markers = ["o", "s", "^", "D", "v", "p", "*", "h", "<", ">"]
+
+    for i, label in enumerate(unique_labels):
         mask = [l == label for l in labels]
         coords_subset = coords[mask]
         count = coords_subset.shape[0]
+        color = colors[i % len(colors)]
+        marker = markers[i % len(markers)]
         ax.scatter(
             coords_subset[:, 0], coords_subset[:, 1],
-            c=[label_to_color[label]],
+            c=color,
+            marker=marker,
             label=f"{label} ({count})",
-            alpha=0.6, s=20,
+            alpha=0.7, s=30,
+            edgecolors="white",
+            linewidths=0.5,
         )
 
     ax.set_title(title, fontsize=14)
-    ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
+    ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=9)
     ax.set_xlabel("t-SNE 1")
     ax.set_ylabel("t-SNE 2")
 
@@ -877,6 +907,8 @@ def main():
     )
 
     parser.add_argument("--checkpoint", type=Path, required=True, help="Path to CLIP checkpoint")
+    parser.add_argument("--stage1-checkpoint", type=Path, default=None,
+                        help="Path to Stage 1 checkpoint (overrides path saved in CLIP checkpoint)")
     parser.add_argument("--data-dir", type=Path, required=True, help="Data directory")
     parser.add_argument("--metadata", type=Path, required=True, help="Metadata file")
     parser.add_argument("--manifest", type=Path, default=None,
@@ -926,7 +958,11 @@ def main():
 
     # Load model
     print(f"Loading model from {args.checkpoint}...")
-    model = load_clip_model(args.checkpoint, device=device)
+    model = load_clip_model(
+        args.checkpoint,
+        device=device,
+        stage1_checkpoint=args.stage1_checkpoint,
+    )
 
     # Load metadata for species/morphometric evaluation
     print(f"Loading metadata from {args.metadata}...")
@@ -1053,6 +1089,22 @@ def main():
         compositional_results=compositional_results,
     )
 
+    # Helper to convert numpy types to native Python for JSON serialization
+    def to_json_serializable(obj):
+        if isinstance(obj, dict):
+            return {k: to_json_serializable(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [to_json_serializable(v) for v in obj]
+        elif isinstance(obj, (np.bool_, np.bool)):
+            return bool(obj)
+        elif isinstance(obj, (np.integer, np.int64, np.int32)):
+            return int(obj)
+        elif isinstance(obj, (np.floating, np.float64, np.float32)):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return obj
+
     # Save machine-readable metrics
     metrics_json = {
         "dataset": {
@@ -1070,13 +1122,8 @@ def main():
             k: v for k, v in species_results.items()
             if not isinstance(v, np.ndarray) and "report" not in k
         } if species_results else {},
-        "morphometric_retrieval": {
-            q: {k: v for k, v in r.items()}
-            for q, r in morphometric_results.items()
-        } if morphometric_results else {},
-        "compositional_queries": {
-            q: r for q, r in compositional_results.items()
-        } if compositional_results else {},
+        "morphometric_retrieval": to_json_serializable(morphometric_results) if morphometric_results else {},
+        "compositional_queries": to_json_serializable(compositional_results) if compositional_results else {},
         "novel_queries": {
             q: {"top_10_precision": r["top_10_precision"]}
             for q, r in novel_query_results.items()

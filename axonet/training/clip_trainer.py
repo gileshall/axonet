@@ -45,7 +45,7 @@ class CLIPLightning(LightningModule):
 
     def __init__(
         self,
-        stage1_checkpoint: str,
+        stage1_checkpoint: str = "",
         clip_embed_dim: int = 512,
         hidden_dim: int = 256,
         freeze_encoder: bool = True,
@@ -79,18 +79,27 @@ class CLIPLightning(LightningModule):
         self.lr_eta_min = lr_eta_min
         self.max_steps = max_steps
 
-        base_model = load_model(
-            Path(stage1_checkpoint),
-            device="cpu",
-            embedding_only=True,
-        )
-
-        self.image_encoder = SegVAE2D_CLIP.from_pretrained(
-            base_model,
-            clip_embed_dim=clip_embed_dim,
-            hidden_dim=hidden_dim,
-            freeze_encoder=freeze_encoder,
-        )
+        # When loading from checkpoint, stage1_checkpoint path may not exist.
+        # Create model architecture without loading weights - they'll come from checkpoint.
+        if stage1_checkpoint and Path(stage1_checkpoint).exists():
+            base_model = load_model(
+                Path(stage1_checkpoint),
+                device="cpu",
+                embedding_only=True,
+            )
+            self.image_encoder = SegVAE2D_CLIP.from_pretrained(
+                base_model,
+                clip_embed_dim=clip_embed_dim,
+                hidden_dim=hidden_dim,
+                freeze_encoder=freeze_encoder,
+            )
+        else:
+            # Create uninitialized model (weights will be loaded from checkpoint)
+            self.image_encoder = SegVAE2D_CLIP(
+                clip_embed_dim=clip_embed_dim,
+                hidden_dim=hidden_dim,
+                freeze_encoder=freeze_encoder,
+            )
 
         # Create text encoder based on name
         if text_encoder_name == "hash" or text_encoder_name.startswith("hash:"):
