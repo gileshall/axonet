@@ -615,6 +615,10 @@ def main():
         "--compile", action="store_true",
         help="Use torch.compile() for faster training (PyTorch 2.0+)"
     )
+    hw_group.add_argument(
+        "--strategy", type=str, default="auto",
+        help="Distributed strategy (auto, ddp, ddp_find_unused_parameters_true)"
+    )
 
     # Reproducibility
     misc_group = parser.add_argument_group("Misc")
@@ -797,6 +801,9 @@ def main():
 
     if args.max_steps is not None:
         trainer_kwargs["max_steps"] = args.max_steps
+
+    if args.strategy != "auto":
+        trainer_kwargs["strategy"] = args.strategy
 
     trainer = Trainer(**trainer_kwargs)
 
