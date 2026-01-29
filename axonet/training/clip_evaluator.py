@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import tempfile
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -19,6 +20,10 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+
+# Suppress DDP stream mismatch warning (benign)
+if hasattr(torch.autograd.graph, "set_warn_on_accumulate_grad_stream_mismatch"):
+    torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
 import torch.nn.functional as F
 from sklearn.manifold import TSNE
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
@@ -35,8 +40,37 @@ from .clip_trainer import CLIPLightning
 # ---------------------------------------------------------------------------
 
 def load_clip_model(checkpoint_path: Path, device: str = "cpu") -> CLIPLightning:
-    """Load trained CLIP model from checkpoint."""
-    model = CLIPLightning.load_from_checkpoint(str(checkpoint_path), map_location=device)
+    """Load trained CLIP model from checkpoint.
+
+    Handles checkpoints saved with torch.compile() by stripping '_orig_mod.' prefix.
+    """
+    # Load checkpoint to check for compiled model state
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+
+    # Check if state dict has _orig_mod. prefix (from torch.compile)
+    if "state_dict" in checkpoint:
+        state_dict = checkpoint["state_dict"]
+        if any(k.startswith("image_encoder._orig_mod.") for k in state_dict.keys()):
+            print("Detected torch.compile checkpoint, stripping '_orig_mod.' prefix...")
+            new_state_dict = {}
+            for k, v in state_dict.items():
+                # Strip _orig_mod. from image_encoder keys
+                if "._orig_mod." in k:
+                    new_k = k.replace("._orig_mod.", ".")
+                    new_state_dict[new_k] = v
+                else:
+                    new_state_dict[k] = v
+            checkpoint["state_dict"] = new_state_dict
+            # Save modified checkpoint to temp location and load from there
+            with tempfile.NamedTemporaryFile(suffix=".ckpt", delete=False) as f:
+                torch.save(checkpoint, f.name)
+                model = CLIPLightning.load_from_checkpoint(f.name, map_location=device)
+                os.unlink(f.name)
+        else:
+            model = CLIPLightning.load_from_checkpoint(str(checkpoint_path), map_location=device)
+    else:
+        model = CLIPLightning.load_from_checkpoint(str(checkpoint_path), map_location=device)
+
     model.eval()
     model.to(device)
     return model
@@ -848,7 +882,8 @@ def main():
     parser.add_argument("--manifest", type=Path, default=None,
                         help="Manifest file (auto-detects val/test)")
     parser.add_argument("--source", default="neuromorpho", help="Data source adapter")
-    parser.add_argument("--id-column", default="neuron_id", help="ID column in metadata")
+    parser.add_argument("--id-column", default="neuron_name",
+                        help="ID column in metadata (use 'neuron_name' for NeuroMorpho, 'cell_specimen_id' for Allen)")
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size")
     parser.add_argument("--max-samples", type=int, default=None, help="Max images to process")
     parser.add_argument("--image-size", type=int, default=512, help="Image size")
