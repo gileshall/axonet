@@ -520,6 +520,11 @@ def load_model(checkpoint_path: Path, device: str, embedding_only: bool = False,
         logger.debug("Stripping 'model.' prefix from state dict keys")
         state_dict = {key[6:] if key.startswith("model.") else key: value for key, value in state_dict.items()}
 
+    # Handle torch.compile() prefix (adds '_orig_mod.' to all keys)
+    if any(key.startswith("_orig_mod.") for key in state_dict.keys()):
+        logger.debug("Stripping '_orig_mod.' prefix from state dict keys (torch.compile checkpoint)")
+        state_dict = {key[10:] if key.startswith("_orig_mod.") else key: value for key, value in state_dict.items()}
+
     if not any(key.startswith("enc0.") or key.startswith("head_") for key in state_dict.keys()):
         raise ValueError(f"Checkpoint {checkpoint_path} does not contain valid model weights. "
                         f"State dict keys: {list(state_dict.keys())[:10]}...")
