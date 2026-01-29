@@ -281,6 +281,30 @@ def _extract_id_from_path(path: Union[str, Path]) -> str:
     return match.group(1) if match else stem
 
 
+def _normalize_neuromorpho_id(neuron_id: str) -> List[str]:
+    """Generate candidate IDs for matching NeuroMorpho-style neuron IDs.
+
+    Handles format like '130683_S2995-x1-25.CNG' -> ['130683_S2995-x1-25.CNG', 'S2995-x1-25', '130683']
+    Returns list of candidates to try for matching.
+    """
+    candidates = [neuron_id]
+
+    # Remove .CNG suffix if present
+    base = neuron_id
+    if base.endswith('.CNG'):
+        base = base[:-4]
+        candidates.append(base)
+
+    # Extract name part after numeric prefix (e.g., '130683_S2995-x1-25' -> 'S2995-x1-25')
+    if '_' in base:
+        parts = base.split('_', 1)
+        if parts[0].isdigit() and len(parts) > 1:
+            candidates.append(parts[1])  # The name part
+            candidates.append(parts[0])  # The numeric ID
+
+    return candidates
+
+
 class NeuronCLIPDataset(Dataset):
     """Dataset for CLIP-style contrastive training with neuron images and text.
 
@@ -377,24 +401,34 @@ class NeuronCLIPDataset(Dataset):
     ) -> List[Dict[str, Any]]:
         """Pair manifest entries with metadata by ID."""
         paired = []
-        
+
         for entry in manifest:
             neuron_id = None
-            
+
             if "cell_id" in entry:
                 neuron_id = str(entry["cell_id"])
             elif "neuron_id" in entry:
                 neuron_id = str(entry["neuron_id"])
             elif "swc" in entry:
                 neuron_id = _extract_id_from_path(entry["swc"])
-            
-            if neuron_id and neuron_id in metadata:
+
+            if not neuron_id:
+                continue
+
+            # Try multiple candidate IDs (handles NeuroMorpho format like '130683_Name.CNG')
+            matched_id = None
+            for candidate in _normalize_neuromorpho_id(neuron_id):
+                if candidate in metadata:
+                    matched_id = candidate
+                    break
+
+            if matched_id:
                 paired.append({
                     "manifest": entry,
-                    "metadata": metadata[neuron_id],
-                    "neuron_id": neuron_id,
+                    "metadata": metadata[matched_id],
+                    "neuron_id": matched_id,
                 })
-        
+
         return paired
 
     def __len__(self) -> int:
