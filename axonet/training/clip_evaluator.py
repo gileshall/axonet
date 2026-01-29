@@ -135,14 +135,13 @@ def aggregate_by_neuron(
     text_embeds: torch.Tensor,
     texts: List[str],
     neuron_ids: List[str],
-    strategy: str = "mean",
+    pooling: str = "mean",
 ) -> Dict[str, Any]:
     """Aggregate per-image embeddings to per-neuron embeddings.
 
     Args:
-        strategy: "mean" - average all pose embeddings for each neuron.
-                  "best" - for each neuron, keep the pose whose embedding
-                           is closest to the mean (most representative view).
+        pooling: "mean" - average all pose embeddings for each neuron.
+                 "max" - element-wise max across all pose embeddings.
 
     Returns dict with aggregated embeddings, one entry per unique neuron.
     """
@@ -166,18 +165,12 @@ def aggregate_by_neuron(
         agg_texts.append(texts[indices[0]])
         agg_text_embeds.append(text_embeds[indices[0]])
 
-        if strategy == "mean":
+        if pooling == "mean":
             agg_image_embeds.append(img_group.mean(dim=0))
-        elif strategy == "best":
-            # Pick the pose closest to the centroid
-            centroid = img_group.mean(dim=0, keepdim=True)
-            centroid = F.normalize(centroid, p=2, dim=-1)
-            normed = F.normalize(img_group, p=2, dim=-1)
-            sims = (normed @ centroid.T).squeeze()
-            best_idx = sims.argmax().item()
-            agg_image_embeds.append(img_group[best_idx])
+        elif pooling == "max":
+            agg_image_embeds.append(img_group.max(dim=0).values)
         else:
-            raise ValueError(f"Unknown aggregation strategy: {strategy}")
+            raise ValueError(f"Unknown pooling method: {pooling}")
 
     return {
         "image_embeds": torch.stack(agg_image_embeds),
@@ -659,40 +652,61 @@ def create_tsne_visualization(
     tsne = TSNE(n_components=2, perplexity=perplexity, random_state=42, max_iter=1000)
     coords = tsne.fit_transform(embeddings.numpy())
 
-    fig, ax = plt.subplots(figsize=(12, 10))
+    fig, ax = plt.subplots(figsize=(14, 11))
     unique_labels = sorted(set(labels))
 
-    # High-contrast colors (colorblind-friendly)
+    # Bright, saturated, high-contrast colors
     colors = [
-        "#e41a1c",  # red
-        "#377eb8",  # blue
-        "#4daf4a",  # green
-        "#984ea3",  # purple
-        "#ff7f00",  # orange
-        "#a65628",  # brown
-        "#f781bf",  # pink
-        "#999999",  # gray
-        "#00ced1",  # dark cyan
-        "#ffd700",  # gold
+        "#FF0000",  # bright red
+        "#0066FF",  # bright blue
+        "#00CC00",  # bright green
+        "#FF00FF",  # magenta
+        "#FF9900",  # bright orange
+        "#00CCCC",  # cyan
+        "#9933FF",  # purple
+        "#FFCC00",  # yellow
+        "#FF6699",  # hot pink
+        "#006600",  # dark green
+        "#660000",  # dark red
+        "#000099",  # dark blue
     ]
 
-    # Distinct marker shapes
-    markers = ["o", "s", "^", "D", "v", "p", "*", "h", "<", ">"]
+    # Very distinct marker shapes - no similar shapes
+    markers = [
+        "o",  # circle
+        "s",  # square
+        "^",  # triangle up
+        "X",  # x (filled)
+        "D",  # diamond
+        "P",  # plus (filled)
+        "*",  # star
+        "v",  # triangle down
+        "p",  # pentagon
+        "H",  # hexagon
+        "<",  # triangle left
+        ">",  # triangle right
+    ]
+
+    # Combine colors and markers to get many unique combinations
+    n_colors = len(colors)
+    n_markers = len(markers)
 
     for i, label in enumerate(unique_labels):
         mask = [l == label for l in labels]
         coords_subset = coords[mask]
         count = coords_subset.shape[0]
-        color = colors[i % len(colors)]
-        marker = markers[i % len(markers)]
+        # Cycle through markers first, then colors (so adjacent labels look very different)
+        marker = markers[i % n_markers]
+        color = colors[i % n_colors]
         ax.scatter(
             coords_subset[:, 0], coords_subset[:, 1],
             c=color,
             marker=marker,
             label=f"{label} ({count})",
-            alpha=0.7, s=30,
-            edgecolors="white",
-            linewidths=0.5,
+            alpha=0.85,
+            s=50,
+            edgecolors="black",
+            linewidths=0.7,
         )
 
     ax.set_title(title, fontsize=14)
@@ -704,6 +718,104 @@ def create_tsne_visualization(
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"Saved: {output_path}")
+
+
+# ---------------------------------------------------------------------------
+# Query lineup visualization
+# ---------------------------------------------------------------------------
+
+def create_query_lineup(
+    model: CLIPLightning,
+    query: str,
+    image_embeds: torch.Tensor,
+    neuron_ids: List[str],
+    texts: List[str],
+    manifest_entries: List[Dict[str, Any]],
+    data_root: Path,
+    output_path: Path,
+    device: str = "cpu",
+    top_k: int = 5,
+):
+    """Create a lineup visualization of top-k neurons for a text query.
+
+    Shows mask_color images side-by-side with similarity scores and descriptions.
+    Designed for use in slide decks.
+    """
+    from PIL import Image
+
+    # Compute query embedding and similarities
+    image_embeds_norm = F.normalize(image_embeds.to(device), p=2, dim=-1)
+    with torch.no_grad():
+        query_embed = model.text_encoder([query])
+        query_embed = F.normalize(query_embed.to(device), p=2, dim=-1)
+
+    sims = (image_embeds_norm @ query_embed.T).squeeze().cpu()
+    top_indices = torch.argsort(sims, descending=True)[:top_k].numpy()
+
+    # Build neuron_id to manifest entry mapping
+    # manifest_entries is a list of dicts with 'neuron_id' and 'manifest' keys
+    nid_to_manifest = {}
+    for entry in manifest_entries:
+        nid = str(entry.get("neuron_id", ""))
+        if nid and nid not in nid_to_manifest:
+            nid_to_manifest[nid] = entry.get("manifest", entry)
+
+    # Load images for top-k neurons
+    images = []
+    labels = []
+    scores = []
+
+    for idx in top_indices:
+        nid = neuron_ids[idx]
+        text = texts[idx]
+        sim = sims[idx].item()
+
+        # Get manifest entry for this neuron
+        manifest = nid_to_manifest.get(str(nid), {})
+
+        # Try to load mask_color image
+        img = None
+        for key in ["mask_color", "mask_bw", "mask"]:
+            if key in manifest:
+                img_path = data_root / manifest[key]
+                if img_path.exists():
+                    try:
+                        img = Image.open(img_path).convert("RGB")
+                        break
+                    except Exception:
+                        continue
+
+        if img is None:
+            # Create placeholder
+            img = Image.new("RGB", (256, 256), color=(128, 128, 128))
+
+        images.append(img)
+        # Truncate text for display
+        short_text = text[:50] + "..." if len(text) > 50 else text
+        labels.append(f"{short_text}\n(id: {nid})")
+        scores.append(sim)
+
+    # Create figure
+    fig, axes = plt.subplots(1, top_k, figsize=(4 * top_k, 5))
+    if top_k == 1:
+        axes = [axes]
+
+    for ax, img, label, score in zip(axes, images, labels, scores):
+        ax.imshow(img)
+        ax.set_title(f"sim: {score:.3f}", fontsize=12, fontweight="bold")
+        ax.set_xlabel(label, fontsize=9, wrap=True)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_edgecolor("#333333")
+            spine.set_linewidth(2)
+
+    # Add query as super title
+    fig.suptitle(f'Query: "{query}"', fontsize=14, fontweight="bold", y=1.02)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches="tight", facecolor="white")
+    plt.close()
+    print(f"Saved lineup: {output_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -923,10 +1035,21 @@ def main():
     parser.add_argument("--device", type=str, default="auto", help="Device")
     parser.add_argument("--skip-tsne", action="store_true", help="Skip t-SNE visualization")
     parser.add_argument(
+        "--n-poses", type=int, default=0,
+        help="Number of poses per neuron to use (0=all). If less than available, randomly samples."
+    )
+    parser.add_argument(
         "--pooling", type=str, default="mean",
-        choices=["mean", "best"],
-        help="Multi-pose aggregation: 'mean' averages all poses, "
-             "'best' picks the most representative pose"
+        choices=["mean", "max"],
+        help="How to aggregate multi-pose embeddings: 'mean' (default) or 'max'"
+    )
+    parser.add_argument(
+        "--lineup-queries", type=str, nargs="*", default=None,
+        help="Generate lineup visualizations for these queries (e.g., 'a pyramidal neuron')"
+    )
+    parser.add_argument(
+        "--lineup-top-k", type=int, default=5,
+        help="Number of top neurons to show in lineup visualizations"
     )
 
     args = parser.parse_args()
@@ -972,7 +1095,7 @@ def main():
     # Create dataset
     adapter = get_adapter(args.source)
     text_gen = NeuronTextGenerator(adapter, augment=False)
-    dataset = NeuronCLIPDataset(
+    full_dataset = NeuronCLIPDataset(
         manifest_path=args.manifest,
         data_root=args.data_dir,
         metadata_path=args.metadata,
@@ -982,8 +1105,35 @@ def main():
         image_size=args.image_size,
     )
 
-    n_images = len(dataset)
-    print(f"Dataset: {n_images:,} images")
+    n_images = len(full_dataset)
+    print(f"Full dataset: {n_images:,} images")
+
+    # Group entries by neuron to determine poses per neuron
+    from torch.utils.data import Subset
+    neuron_to_indices: Dict[str, List[int]] = defaultdict(list)
+    for i, entry in enumerate(full_dataset.entries):
+        nid = str(entry.get("neuron_id", ""))
+        neuron_to_indices[nid].append(i)
+
+    n_neurons_total = len(neuron_to_indices)
+    max_poses = max(len(v) for v in neuron_to_indices.values())
+
+    # Pre-sample if n_poses is set and less than available
+    if args.n_poses > 0 and args.n_poses < max_poses:
+        print(f"Pre-sampling {args.n_poses} pose(s) per neuron...")
+        sampled_indices = []
+        for nid, indices in neuron_to_indices.items():
+            n_samples = min(args.n_poses, len(indices))
+            sampled = np.random.choice(indices, n_samples, replace=False).tolist()
+            sampled_indices.extend(sampled)
+
+        sampled_indices.sort()  # Keep order for reproducibility
+        dataset = Subset(full_dataset, sampled_indices)
+        print(f"Sampled dataset: {len(dataset):,} images ({n_neurons_total} neurons, {args.n_poses} poses each)")
+    else:
+        dataset = full_dataset
+        if args.n_poses > 0:
+            print(f"Using all poses (n_poses={args.n_poses} >= available={max_poses})")
 
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
@@ -995,11 +1145,11 @@ def main():
     print(f"Computed {n_raw:,} image embeddings")
 
     # Aggregate to neuron level
-    print(f"\nAggregating to neuron level (strategy={args.pooling})...")
+    print(f"\nAggregating to neuron level (pooling={args.pooling})...")
     agg = aggregate_by_neuron(
         raw["image_embeds"], raw["text_embeds"],
         raw["texts"], raw["neuron_ids"],
-        strategy=args.pooling,
+        pooling=args.pooling,
     )
 
     n_neurons = len(agg["neuron_ids"])
@@ -1077,6 +1227,31 @@ def main():
             args.output_dir / "tsne_species.png",
             max_samples=2000,
         )
+
+    # Query lineup visualizations
+    if args.lineup_queries:
+        print("\nCreating query lineup visualizations...")
+        lineup_dir = args.output_dir / "lineups"
+        lineup_dir.mkdir(exist_ok=True)
+
+        for query in args.lineup_queries:
+            # Create safe filename from query
+            safe_name = "".join(c if c.isalnum() or c in " -_" else "_" for c in query)
+            safe_name = safe_name.replace(" ", "_")[:50]
+            output_path = lineup_dir / f"lineup_{safe_name}.png"
+
+            create_query_lineup(
+                model=model,
+                query=query,
+                image_embeds=image_embeds,
+                neuron_ids=neuron_ids,
+                texts=texts,
+                manifest_entries=full_dataset.entries,
+                data_root=args.data_dir,
+                output_path=output_path,
+                device=device,
+                top_k=args.lineup_top_k,
+            )
 
     # Report
     print_report(
