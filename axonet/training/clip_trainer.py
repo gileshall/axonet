@@ -17,6 +17,10 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import pytorch_lightning as pl
 import torch
 import torch.nn as nn
+
+# Suppress DDP stream mismatch warning (benign with find_unused_parameters)
+if hasattr(torch.autograd.graph, "set_warn_on_accumulate_grad_stream_mismatch"):
+    torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
 from pytorch_lightning import LightningDataModule, LightningModule, Trainer
 from pytorch_lightning.callbacks import (
     EarlyStopping,
@@ -152,9 +156,12 @@ class CLIPLightning(LightningModule):
             return_accuracy=True,
         )
 
-        self.log(f"{stage}/loss", loss, on_step=True, on_epoch=True, prog_bar=True)
+        batch_size = images.shape[0]
+        self.log(f"{stage}/loss", loss, on_step=True, on_epoch=True, prog_bar=True,
+                 batch_size=batch_size, sync_dist=True)
         for k, v in logs.items():
-            self.log(f"{stage}/{k}", v, on_step=True, on_epoch=True)
+            self.log(f"{stage}/{k}", v, on_step=True, on_epoch=True,
+                     batch_size=batch_size, sync_dist=True)
 
         return {"loss": loss, "logs": logs}
 
